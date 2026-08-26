@@ -789,10 +789,39 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
     setProcessingProgress(2);
     setProcessingStage("Подготавливаем утверждённое превью…");
     try {
+      let exactPaletteSubset: PaintColor[] | undefined;
+      if (!activeProject.aiPalette?.length) {
+        const image = new Image();
+        image.src = activeProject.aiPreviewUrl;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d", { willReadFrequently: true })!;
+        context.imageSmoothingEnabled = false;
+        context.drawImage(image, 0, 0);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        const paletteKeys = new Set(palette.map((paint) => Number.parseInt(paint.hex.slice(1), 16)));
+        const usedKeys = new Set<number>();
+        let isExactPaletteRaster = true;
+        for (let offset = 0; offset < pixels.length; offset += 4) {
+          const key = (pixels[offset] << 16) | (pixels[offset + 1] << 8) | pixels[offset + 2];
+          if (pixels[offset + 3] !== 255 || !paletteKeys.has(key)) {
+            isExactPaletteRaster = false;
+            break;
+          }
+          usedKeys.add(key);
+        }
+        if (isExactPaletteRaster) {
+          exactPaletteSubset = palette.filter((paint) => usedKeys.has(Number.parseInt(paint.hex.slice(1), 16)));
+        }
+      }
       const aiPalette = activeProject.aiPalette?.length
         ? activeProject.aiPalette
+        : exactPaletteSubset
+          ? exactPaletteSubset
         : await selectProductionColors(activeProject.aiPreviewUrl, palette, Math.min(aiColorCount, palette.length));
-      const paletteReadyPreview = activeProject.aiPalette?.length
+      const paletteReadyPreview = activeProject.aiPalette?.length || exactPaletteSubset
         ? activeProject.aiPreviewUrl
         : await snapImageToProductionPalette(activeProject.aiPreviewUrl, aiPalette);
       setProcessingProgress(8);
