@@ -17,121 +17,124 @@ The project card also records the historical control values for NEW174:
 - removed/merged areas: `349`
 - unlabeled regions: `0`
 
-These values are controls, not a reason to force the algorithm to fake those numbers.
+These values are controls, not targets to fake.
 
-## First confirmed pipeline problem
+## Confirmed pipeline behavior
 
-The app currently has two different meanings mixed together:
+There are three distinct states that must not be mixed:
 
-1. an AI/artwork preview that still needs to be snapped once to the production palette;
-2. an already approved palette-mapped preview that must be treated as immutable geometry.
+1. raw source photo;
+2. AI/artwork preview that may still need one snap to the production palette;
+3. ready production-palette preview whose geometry must be treated as the reference for regions/contours.
 
-`snapImageToProductionPalette()` is not an identity operation. It performs edge-aware smoothing, nearest-palette mapping and `majorityCleanup()` before returning the PNG.
+`snapImageToProductionPalette()` is NOT an identity operation. It performs edge-aware smoothing, nearest-palette assignment and `majorityCleanup()`.
 
-That is acceptable only for the one-time conversion of an AI/artwork preview into the approved production-palette raster.
+### Confirmed ready-preview problem
 
-It is NOT acceptable to call this function again when rebuilding contours from an already approved palette-mapped preview.
+`loadApprovedPreview()` stores a user-uploaded ready preview as `aiPreviewUrl` but clears `aiPalette`.
 
-At least one regeneration path in `app/studio.tsx` currently calls `snapImageToProductionPalette(activeProject.approvedPreviewUrl, aiPalette)` before `processPaintImage(..., "approved")`. This means an already approved reference can be cleaned/smoothed again before connected regions are built.
+Then `prepareProductionMap()` sees no `aiPalette`, selects colors again and runs:
 
-This violates the project rule: fix the earliest divergent stage and do not compensate later.
+`snapImageToProductionPalette(activeProject.aiPreviewUrl, aiPalette)`
 
-## Phase 1 — do only this first
+before `processPaintImage(..., "approved")`.
+
+Therefore a user-uploaded preview that is already the desired production-palette artwork can be cleaned/recolored again before connected regions are extracted.
+
+This is the earliest confirmed place where an already-good preview can diverge from its intended geometry.
+
+### Confirmed second geometry-changing stage
+
+Inside `processPaintImage(..., "approved")`, the initial label map is copied and then `mergeUnnumberableAreas()` may run up to 24 passes. Regions that cannot fit the current 5 pt number-placement test are recolored into neighbouring regions before contours are traced.
+
+So the current pipeline is effectively:
+
+`ready preview -> optional second snap/cleanup -> labels -> merge for number fit -> contours`
+
+This means contour geometry is coupled to numbering constraints. For the current contours-only task, this coupling must be measured against the Golden Reference rather than assumed correct.
+
+## Phase 1 — preserve a ready preview exactly before region logic
 
 ### Goal
 
-Make an approved palette-mapped preview immutable.
+When the input is explicitly a ready/approved production-palette preview, do not snap or clean it again.
 
-### Required behavior
+Required path:
 
-For an image that is already the approved production-palette raster:
+`ready palette raster -> exact color labels -> connected regions`
 
-`approved palette raster -> exact labels -> regions`
-
-There must be no second:
+No second:
 
 - smoothing;
 - majority cleanup;
 - palette snapping;
 - recoloring;
-- resampling other than unavoidable image decode/dimension preservation.
+- AI redraw.
 
-### NEW174 regression path
+### NEW174 regression
 
-For the first test, feed this file directly into the approved processing path:
+Feed this file directly to the approved label/region path:
 
 `/reference/new174/approved-preview.png`
 
 with the NEW174 28-color palette.
 
-Do NOT pass it through `snapImageToProductionPalette()` first.
+Do NOT call `snapImageToProductionPalette()` on this fixture.
 
-Generate the intermediate label/region map and contour result.
+Before changing merge or contour tracing, report:
 
-Compare against:
-
-`/reference/new174/production-contours.png`
-
-Report:
-
-- width/height used by the processor;
-- unique colors before label extraction;
+- working width/height;
+- unique input colors;
 - raw connected-component count;
-- region count after cleanup/merge;
+- exact deterministic checkpoint/hash of the initial label map if practical.
+
+## Phase 2 — measure the merge stage separately
+
+Run the same NEW174 label map through the current `mergeUnnumberableAreas()` implementation and report:
+
+- raw region count before merge;
+- final region count after merge;
 - removed/merged count;
 - unlabeled count;
-- whether repeated runs produce the identical checkpoint/result.
+- repeatability across repeated runs;
+- visual comparison of the final region map with the known-good contour reference.
 
-## Stop condition after Phase 1
+Historical controls are 541 final regions, 349 merged/removed areas and 0 unlabeled regions.
 
-Do not change `mergeUnnumberableAreas()`, `traceUniqueBoundaries()`, SVG/PDF, numbering geometry or semantic-detail restoration in the same change.
+Do not change merge semantics until this comparison exists.
 
-After bypassing the second snap/cleanup, run NEW174 and report the result.
+### Merge implementation to audit if it diverges
 
-If NEW174 now matches the known-good contour structure closely, the earliest bug was the repeated palette cleanup.
+The current comments describe a stable/batch behavior from accepted production scripts, while the implementation recolors component pixels immediately while iterating a component/adjacency snapshot. If NEW174 diverges after Phase 1, inspect this order dependence before changing contour tracing.
 
-If it still diverges, stop and move to Phase 2 audit below. Do not add downstream hacks.
+## Phase 3 — contour tracer only after Final Region Map is validated
 
-## Phase 2 audit — only if Phase 1 is insufficient
-
-Inspect `mergeUnnumberableAreas()` before changing contour tracing.
-
-There is a suspicious implementation inconsistency in baseline v26:
-
-- the comments say the accepted production script merged failed component IDs as a stable batch;
-- the current loop applies pixel recoloring immediately while iterating the same snapshot of components/adjacency.
-
-This makes the result order-dependent and can change which neighbour later failed components effectively join.
-
-If NEW174 still diverges after Phase 1, compare the current immediate-merge behavior against the known-good batch semantics before touching `traceUniqueBoundaries()`.
-
-## Phase 3 audit — only after the Final Region Map matches
-
-Only when the final label map is proven correct should `traceUniqueBoundaries()` be evaluated.
-
-The contour tracer should remain a renderer of the Final Region Map, not a place to repair segmentation mistakes.
+`traceUniqueBoundaries()` must be treated only as a renderer of the final label map.
 
 Check:
 
-- one unique shared boundary between neighbouring labels;
+- exactly one shared boundary between different neighbouring labels;
 - junction continuity;
-- no duplicate/offset boundaries;
-- smoothing does not move junction endpoints;
+- no duplicate/offset lines;
+- smoothing does not move branch/junction endpoints incorrectly;
 - closed cycles remain closed;
-- no new geometry is invented from raster edge detection.
+- no geometry is invented from source-image edge detection.
 
-## Important architectural rule
+Only change simplification/smoothing after proving that the Final Region Map itself matches the Golden Reference.
 
-Do not use protected-detail contour overlays as a permanent substitute for a correct Final Region Map.
+## Important architectural direction
 
-The desired end state is one canonical region map for production geometry. If a meaningful detail must survive, preserve it in that map through the region policy rather than deleting it and redrawing a separate compensating contour layer later.
+The long-term production geometry should come from one canonical Final Region Map.
+
+The current separate protected-detail overlay may be useful diagnostically, but should not become a permanent way to delete meaningful geometry from the base map and redraw it later as a compensating line layer. Meaningful details should survive in the canonical region policy whenever possible.
 
 ## Current work order
 
-1. Bypass repeated `snapImageToProductionPalette()` for already approved palette rasters.
-2. Run NEW174 direct Golden regression.
-3. Report exact statistics and visual comparison.
-4. If still wrong, audit merge semantics.
-5. Only then audit contour tracing.
+1. Add an explicit path/state for a ready production-palette preview so it bypasses `snapImageToProductionPalette()`.
+2. Run NEW174 directly from `approved-preview.png` and record raw region statistics.
+3. Run current merge logic unchanged and record final statistics.
+4. Compare result to `production-contours.png` and the 541/349/0 controls.
+5. If the map diverges, audit merge semantics.
+6. Only after the map matches, inspect `traceUniqueBoundaries()`.
 
-Do not work on PDF, UI, auth, database or unrelated features.
+Do not work on PDF, UI redesign, auth, database or unrelated features.
