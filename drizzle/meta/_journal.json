@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1787668490026,
+      "tag": "0000_solid_captain_cross",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1787669931284,
+      "tag": "0001_unique_salo",
+      "breakpoints": true
+    }
+  ]
+}
