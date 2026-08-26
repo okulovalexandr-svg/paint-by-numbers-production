@@ -1419,10 +1419,10 @@ export async function processPaintImage(
   image.src = fileUrl;
   await image.decode();
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  // Approved AI maps keep their native detail (up to 1600 px on the long
-  // edge), matching the accepted full-detail production checkpoints. Only raw
-  // photographs use the smaller, smoother local draft path.
-  const maximumWorkingEdge = mode === "source" ? 1000 : 1600;
+  // Manually approved maps keep their native detail up to the production-size
+  // edge. AI-approved maps retain the existing 1600 px cap, while raw
+  // photographs continue to use the smaller, smoother local draft path.
+  const maximumWorkingEdge = mode === "source" ? 1000 : mode === "approved" ? 3000 : 1600;
   const resizeScale = Math.min(1, maximumWorkingEdge / Math.max(image.width, image.height));
   const width = Math.max(1, Math.round(image.width * resizeScale));
   const height = Math.max(1, Math.round(image.height * resizeScale));
