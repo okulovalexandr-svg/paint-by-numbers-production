@@ -3,6 +3,13 @@
 ## Status
 The approved artwork preview already exists conceptually and must be treated as fixed. The current blocker is the production contour stage.
 
+## Mandatory execution plan
+Before changing code, read `docs/CONTOUR_AUDIT.md`.
+
+Execute the phases in that file in order. Do not skip directly to contour smoothing or general refactoring.
+
+The immediate next action is **Phase 1** from `docs/CONTOUR_AUDIT.md`: make a ready production-palette preview bypass any second palette snap/cleanup, then run NEW174 as the Golden regression fixture and report the intermediate statistics before changing merge or contour-tracing logic.
+
 ## Goal
 Create production-quality regions and contours that preserve the approved preview and match the contour quality previously achieved successfully in chat/manual processing.
 
