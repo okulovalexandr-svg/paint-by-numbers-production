@@ -1341,7 +1341,6 @@ async function collectNumberMarks(
   let unlabeledRegionCount = 0;
   let protectedRegionCount = 0;
   let minimumRegionArea = Number.POSITIVE_INFINITY;
-  const coverageArea = labels.length / 18;
   await walkComponents(labels, width, height, colorCount, (component) => {
     const placementComponent = componentAvailableForNumbers(component, width, numberExclusionMask);
     // Fully covered underpaint belongs to the source-first detail overlay,
@@ -1356,28 +1355,16 @@ async function collectNumberMarks(
     const orientation = placementComponent ? componentOrientation(placementComponent, width) : { angle: 0, elongation: 1 };
     const protectionLevel = componentProtectionLevel(component, protectionMask);
     if (protectionLevel) protectedRegionCount++;
-    const span = Math.max(component.maxX - component.minX + 1, component.maxY - component.minY + 1);
-    const desired = Math.max(1, Math.min(8, Math.max(Math.ceil(component.pixels.length / coverageArea), Math.ceil(span / 210))));
-    const anchors: number[] = [];
-    const placements: Array<NonNullable<ReturnType<typeof findNumberPlacement>>> = [];
-    const minimumSpacing = Math.max(54, Math.sqrt(component.pixels.length / desired) * 0.68);
-    for (let markIndex = 0; markIndex < desired && placementComponent; markIndex++) {
-      const placement = findNumberPlacement(
-        placementComponent,
-        width,
-        component.label,
-        distance,
-        geometry,
-        orientation,
-        scale,
-        anchors,
-        minimumSpacing,
-      );
-      if (!placement) break;
-      anchors.push(placement.anchor);
-      placements.push(placement);
-    }
-    for (const placement of placements) {
+    const placement = placementComponent ? findNumberPlacement(
+      placementComponent,
+      width,
+      component.label,
+      distance,
+      geometry,
+      orientation,
+      scale,
+    ) : null;
+    if (placement) {
       const fontSize = Math.max(scale.minimumFontPx, Math.min(scale.maximumFontPx, placement.fit.fontSize, placement.clearance * 2.1));
       marks.push({
         label: component.label,
