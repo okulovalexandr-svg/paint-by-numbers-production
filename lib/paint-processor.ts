@@ -1639,18 +1639,23 @@ export async function processPaintImage(
 
   const numbering = await collectNumberMarks(labels, width, height, usedPaints.length, physicalScale, protectionMask, finalNumberExclusionMask, cooperativeYield);
   const marks = numbering.marks;
-  // PNG is only an on-screen proof. Production geometry is exported directly
-  // as vector SVG/PDF, so a 2x raster here only wastes memory and time.
-  const renderScale = 1;
+  // Normalize the raster proof to the historical 40 x 50 cm Golden canvas.
+  // Production SVG/PDF keep using the original working coordinates below.
+  const schemeWidth = 2400;
+  const schemeHeight = 3000;
+  const schemeScaleX = schemeWidth / width;
+  const schemeScaleY = schemeHeight / height;
+  const schemePixelsPerMm = schemeWidth / ARTWORK_WIDTH_MM;
+  const schemeContourWidthPx = 0.25 * POINT_TO_MM * schemePixelsPerMm;
+  const schemeFontScale = schemePixelsPerMm / physicalScale.pixelsPerMm;
   const scheme = document.createElement("canvas");
-  scheme.width = width * renderScale;
-  scheme.height = height * renderScale;
+  scheme.width = schemeWidth;
+  scheme.height = schemeHeight;
   const schemeContext = scheme.getContext("2d")!;
-  schemeContext.scale(renderScale, renderScale);
   schemeContext.fillStyle = "#ffffff";
-  schemeContext.fillRect(0, 0, width, height);
+  schemeContext.fillRect(0, 0, schemeWidth, schemeHeight);
   schemeContext.strokeStyle = "#777777";
-  schemeContext.lineWidth = physicalScale.contourWidthPx;
+  schemeContext.lineWidth = schemeContourWidthPx;
   schemeContext.lineJoin = "round";
   schemeContext.lineCap = "round";
   await report("Строим точные векторные контуры…", 82);
@@ -1661,35 +1666,40 @@ export async function processPaintImage(
   const detailPaths = clipPathsToMask(rawDetailPaths, detailContourMask, width, height);
   schemeContext.beginPath();
   for (const path of contourPaths) {
-    schemeContext.moveTo(path[0][0], path[0][1]);
-    for (let index = 1; index < path.length; index++) schemeContext.lineTo(path[index][0], path[index][1]);
+    schemeContext.moveTo(path[0][0] * schemeScaleX, path[0][1] * schemeScaleY);
+    for (let index = 1; index < path.length; index++) {
+      schemeContext.lineTo(path[index][0] * schemeScaleX, path[index][1] * schemeScaleY);
+    }
   }
   schemeContext.stroke();
   if (detailPaths.length) {
     schemeContext.beginPath();
     schemeContext.strokeStyle = "#6f6f6f";
-    schemeContext.lineWidth = Math.max(0.45, physicalScale.contourWidthPx * 0.72);
+    schemeContext.lineWidth = Math.max(0.45, schemeContourWidthPx * 0.72);
     for (const path of detailPaths) {
-      schemeContext.moveTo(path[0][0], path[0][1]);
-      for (let index = 1; index < path.length; index++) schemeContext.lineTo(path[index][0], path[index][1]);
+      schemeContext.moveTo(path[0][0] * schemeScaleX, path[0][1] * schemeScaleY);
+      for (let index = 1; index < path.length; index++) {
+        schemeContext.lineTo(path[index][0] * schemeScaleX, path[index][1] * schemeScaleY);
+      }
     }
     schemeContext.stroke();
   }
   schemeContext.strokeStyle = "#666666";
   schemeContext.lineWidth = 0.55;
-  schemeContext.strokeRect(0.4, 0.4, width - 0.8, height - 0.8);
+  schemeContext.strokeRect(0.4, 0.4, schemeWidth - 0.8, schemeHeight - 0.8);
   schemeContext.textAlign = "center";
   schemeContext.textBaseline = "middle";
   schemeContext.fillStyle = "#777777";
   for (const mark of [...marks].sort((a, b) => b.area - a.area)) {
     const value = String(mark.label + 1);
+    const schemeFontSize = mark.fontSize * schemeFontScale;
     schemeContext.save();
-    schemeContext.translate(mark.x, mark.y);
+    schemeContext.translate(mark.x * schemeScaleX, mark.y * schemeScaleY);
     if (mark.rotation) schemeContext.rotate(mark.rotation * Math.PI / 180);
     schemeContext.scale(0.78, 1);
-    schemeContext.font = `400 ${mark.fontSize}px Arial`;
+    schemeContext.font = `400 ${schemeFontSize}px Arial`;
     if (mark.stacked && value.length > 1) {
-      const offset = mark.fontSize * .38;
+      const offset = schemeFontSize * .38;
       schemeContext.fillText(value[0], 0, -offset);
       schemeContext.fillText(value.slice(1), 0, offset);
     } else {
