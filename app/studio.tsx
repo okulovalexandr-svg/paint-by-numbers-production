@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import {
+  correctNonSemanticGeometry,
   correctNonSemanticNoise,
   processPaintImage,
   selectProductionColors,
@@ -714,14 +715,16 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const semantic = await analyzeSemanticPreview(palettePreview);
       setProcessingStage("Убираем безопасные шумовые микрообласти…");
       const correction = await correctNonSemanticNoise(palettePreview, selectedProductionPalette, semantic.regions);
+      setProcessingStage("Расширяем безопасные узкие области…");
+      const geometryCorrection = await correctNonSemanticGeometry(correction.correctedRaster, selectedProductionPalette, semantic.regions);
       setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
-      const readiness = await validateProductionReadiness(correction.correctedRaster, selectedProductionPalette, {
+      const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, selectedProductionPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
       if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем единую карту областей из ИИ-превью…");
       const result = await processPaintImage(
-        correction.correctedRaster,
+        geometryCorrection.correctedRaster,
         selectedProductionPalette,
         selectedProductionPalette.length,
         "approved",
@@ -766,7 +769,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         protectedRegionCount: result.protectedRegionCount,
         minimumRegionArea: result.minimumRegionArea,
         semanticRegions: semantic.regions,
-        semanticPreviewUrl: correction.correctedRaster,
+        semanticPreviewUrl: geometryCorrection.correctedRaster,
         semanticAnalysisCostUsd: semantic.costUsd,
         aiCostUsd: Number(((activeProject.aiCostUsd || 0) + generationCost + semantic.costUsd).toFixed(6)),
         lastAiCostUsd: Number((generationCost + semantic.costUsd).toFixed(6)) || undefined,
@@ -846,15 +849,17 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         : await analyzeSemanticPreview(paletteReadyPreview);
       setProcessingStage("Убираем безопасные шумовые микрообласти…");
       const correction = await correctNonSemanticNoise(paletteReadyPreview, aiPalette, semantic.regions);
+      setProcessingStage("Расширяем безопасные узкие области…");
+      const geometryCorrection = await correctNonSemanticGeometry(correction.correctedRaster, aiPalette, semantic.regions);
       setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
-      const readiness = await validateProductionReadiness(correction.correctedRaster, aiPalette, {
+      const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, aiPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
       if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем загруженное превью как единую карту областей…");
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const result = await processPaintImage(
-        correction.correctedRaster,
+        geometryCorrection.correctedRaster,
         aiPalette,
         aiPalette.length,
         "approved",
@@ -900,7 +905,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         protectedRegionCount: result.protectedRegionCount,
         minimumRegionArea: result.minimumRegionArea,
         semanticRegions: semantic.regions,
-        semanticPreviewUrl: correction.correctedRaster,
+        semanticPreviewUrl: geometryCorrection.correctedRaster,
         semanticAnalysisCostUsd: semantic.costUsd,
         aiCostUsd: Number(((activeProject.aiCostUsd || 0) + (activeProject.semanticRegions?.length ? 0 : semantic.costUsd)).toFixed(6)),
         lastAiCostUsd: activeProject.semanticRegions?.length

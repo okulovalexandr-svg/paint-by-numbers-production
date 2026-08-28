@@ -29,5 +29,8 @@ A palette-ready preview may be approved only when every 4-connected visible regi
 ## D-009 — Phase B may remove only proven non-semantic noise before approval
 Before readiness validation, a failed component may be absorbed into an adjacent stable component only when it is smaller than 4 mm², outside every semantic region and its physical 2 mm halo, and its removal cannot eliminate its production color. The correction is deterministic, changes only the component's own pixels, and never runs on an approved Final Region Map.
 
+## D-010 — Phase C may minimally expand only non-semantic irregular regions
+After Phase B and before readiness validation, a remaining failed non-semantic component of at least 4 mm² may borrow safe adjacent pixels without changing its production color. Expansion is capped at 2 mm and `min(12 mm², 50% of target area)`, must preserve donor connectivity and its existing 5 pt placement, and never runs on semantic geometry or an approved Final Region Map.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
