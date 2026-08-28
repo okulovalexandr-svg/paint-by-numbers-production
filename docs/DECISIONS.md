@@ -26,5 +26,8 @@ Once the Golden Reference artifacts are committed, changes must be checked again
 ## D-008 — Approved previews must pass production readiness before approval
 A palette-ready preview may be approved only when every 4-connected visible region fits the exact production 5 pt number test. A validated approved map is the immutable Final Region Map; production SVG/PDF generation must not merge, recolor, clean or resegment it.
 
+## D-009 — Phase B may remove only proven non-semantic noise before approval
+Before readiness validation, a failed component may be absorbed into an adjacent stable component only when it is smaller than 4 mm², outside every semantic region and its physical 2 mm halo, and its removal cannot eliminate its production color. The correction is deterministic, changes only the component's own pixels, and never runs on an approved Final Region Map.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

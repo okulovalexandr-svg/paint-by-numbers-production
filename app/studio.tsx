@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import {
+  correctNonSemanticNoise,
   processPaintImage,
   selectProductionColors,
   snapImageToProductionPalette,
@@ -711,14 +712,16 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       setProcessingStage("Распознаём глаза, надписи и важные детали…");
       const palettePreview = await snapImageToProductionPalette(payload.image, selectedProductionPalette);
       const semantic = await analyzeSemanticPreview(palettePreview);
+      setProcessingStage("Убираем безопасные шумовые микрообласти…");
+      const correction = await correctNonSemanticNoise(palettePreview, selectedProductionPalette, semantic.regions);
       setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
-      const readiness = await validateProductionReadiness(palettePreview, selectedProductionPalette, {
+      const readiness = await validateProductionReadiness(correction.correctedRaster, selectedProductionPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
       if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем единую карту областей из ИИ-превью…");
       const result = await processPaintImage(
-        palettePreview,
+        correction.correctedRaster,
         selectedProductionPalette,
         selectedProductionPalette.length,
         "approved",
@@ -763,7 +766,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         protectedRegionCount: result.protectedRegionCount,
         minimumRegionArea: result.minimumRegionArea,
         semanticRegions: semantic.regions,
-        semanticPreviewUrl: palettePreview,
+        semanticPreviewUrl: correction.correctedRaster,
         semanticAnalysisCostUsd: semantic.costUsd,
         aiCostUsd: Number(((activeProject.aiCostUsd || 0) + generationCost + semantic.costUsd).toFixed(6)),
         lastAiCostUsd: Number((generationCost + semantic.costUsd).toFixed(6)) || undefined,
@@ -841,15 +844,17 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const semantic = activeProject.semanticRegions?.length
         ? { regions: activeProject.semanticRegions, costUsd: activeProject.semanticAnalysisCostUsd || 0 }
         : await analyzeSemanticPreview(paletteReadyPreview);
+      setProcessingStage("Убираем безопасные шумовые микрообласти…");
+      const correction = await correctNonSemanticNoise(paletteReadyPreview, aiPalette, semantic.regions);
       setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
-      const readiness = await validateProductionReadiness(paletteReadyPreview, aiPalette, {
+      const readiness = await validateProductionReadiness(correction.correctedRaster, aiPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
       if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем загруженное превью как единую карту областей…");
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const result = await processPaintImage(
-        paletteReadyPreview,
+        correction.correctedRaster,
         aiPalette,
         aiPalette.length,
         "approved",
@@ -895,7 +900,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         protectedRegionCount: result.protectedRegionCount,
         minimumRegionArea: result.minimumRegionArea,
         semanticRegions: semantic.regions,
-        semanticPreviewUrl: paletteReadyPreview,
+        semanticPreviewUrl: correction.correctedRaster,
         semanticAnalysisCostUsd: semantic.costUsd,
         aiCostUsd: Number(((activeProject.aiCostUsd || 0) + (activeProject.semanticRegions?.length ? 0 : semantic.costUsd)).toFixed(6)),
         lastAiCostUsd: activeProject.semanticRegions?.length

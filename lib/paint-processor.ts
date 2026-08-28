@@ -65,6 +65,25 @@ export type ProductionReadinessOptions = {
   semanticAvailable?: boolean;
 };
 
+export type NonSemanticNoiseCorrectionDiagnostics = {
+  correctedComponentCount: number;
+  correctedPixelCount: number;
+  correctedAreaMm2: number;
+  correctedAreaPercent: number;
+  skippedSemanticCount: number;
+  skippedTooLargeCount: number;
+  skippedNoNeighborCount: number;
+  skippedOnlyColorCount: number;
+  semanticFailCountAfter: number;
+  nonSemanticFailCountAfter: number;
+  semanticPixelChangeCount: number;
+};
+
+export type NonSemanticNoiseCorrectionResult = {
+  correctedRaster: string;
+  diagnostics: NonSemanticNoiseCorrectionDiagnostics;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -219,6 +238,32 @@ function buildCriticalDetailMask(width: number, height: number, regions: Semanti
     }
   }
   return mask;
+}
+
+function buildSemanticNoiseMasks(width: number, height: number, regions: SemanticRegion[]) {
+  const semantic = new Uint8Array(width * height);
+  const halo = new Uint8Array(width * height);
+  const haloX = Math.ceil(2 / (ARTWORK_WIDTH_MM / width));
+  const haloY = Math.ceil(2 / (ARTWORK_HEIGHT_MM / height));
+  for (const region of regions) {
+    const x0 = Math.max(0, Math.floor(region.x * width));
+    const y0 = Math.max(0, Math.floor(region.y * height));
+    const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
+    const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
+    for (let y = y0; y < y1; y++) {
+      const row = y * width;
+      for (let x = x0; x < x1; x++) semantic[row + x] = 1;
+    }
+    const haloX0 = Math.max(0, x0 - haloX);
+    const haloY0 = Math.max(0, y0 - haloY);
+    const haloX1 = Math.min(width, x1 + haloX);
+    const haloY1 = Math.min(height, y1 + haloY);
+    for (let y = haloY0; y < haloY1; y++) {
+      const row = y * width;
+      for (let x = haloX0; x < haloX1; x++) halo[row + x] = 1;
+    }
+  }
+  return { semantic, halo };
 }
 
 function dilateMask(mask: Uint8Array, width: number, height: number, radius = 2) {
@@ -1484,6 +1529,189 @@ function physicalMetricSummary(values: number[]): ProductionReadinessPhysicalMet
     p90: at(.9),
     max: sorted[sorted.length - 1],
   };
+}
+
+export async function correctNonSemanticNoise(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+): Promise<NonSemanticNoiseCorrectionResult> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const cooperativeYield = createCooperativeYield();
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const resizeScale = Math.min(1, 3000 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * resizeScale));
+  const height = Math.max(1, Math.round(image.height * resizeScale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, width, height);
+  const imageData = context.getImageData(0, 0, width, height);
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  const paletteKeys = new Set(palette.map((paint) => Number.parseInt(paint.hex.slice(1), 16)));
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    const source = pixel * 4;
+    if (imageData.data[source + 3] !== 255) throw new Error("Production-ready preview must be fully opaque");
+    const key = (imageData.data[source] << 16) | (imageData.data[source + 1] << 8) | imageData.data[source + 2];
+    if (!paletteKeys.has(key)) throw new Error("Noise correction requires exact production palette colors");
+    rgb[pixel * 3] = imageData.data[source];
+    rgb[pixel * 3 + 1] = imageData.data[source + 1];
+    rgb[pixel * 3 + 2] = imageData.data[source + 2];
+    if ((pixel & 131071) === 0) await cooperativeYield();
+  }
+
+  const approved = approvedPaletteAssignment(rgb, palette);
+  const labels = new Uint8Array(width * height);
+  const labelPixelCounts = new Uint32Array(approved.selectedPaints.length);
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    const key = (rgb[pixel * 3] << 16) | (rgb[pixel * 3 + 1] << 8) | rgb[pixel * 3 + 2];
+    const label = approved.assignment.get(key) ?? 0;
+    labels[pixel] = label;
+    labelPixelCounts[label]++;
+  }
+
+  const components: Component[] = [];
+  const componentMap = new Int32Array(labels.length);
+  await walkComponents(labels, width, height, approved.selectedPaints.length, (component) => {
+    const id = components.length;
+    components.push(component);
+    for (const pixel of component.pixels) componentMap[pixel] = id;
+  }, cooperativeYield);
+  const adjacency = new Map<number, Map<number, number>>();
+  const addAdjacency = (left: number, right: number) => {
+    if (left === right) return;
+    let neighbours = adjacency.get(left);
+    if (!neighbours) { neighbours = new Map(); adjacency.set(left, neighbours); }
+    neighbours.set(right, (neighbours.get(right) || 0) + 1);
+    neighbours = adjacency.get(right);
+    if (!neighbours) { neighbours = new Map(); adjacency.set(right, neighbours); }
+    neighbours.set(left, (neighbours.get(left) || 0) + 1);
+  };
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      const index = row + x;
+      if (x + 1 < width) addAdjacency(componentMap[index], componentMap[index + 1]);
+      if (y + 1 < height) addAdjacency(componentMap[index], componentMap[index + width]);
+    }
+    if ((y & 31) === 0) await cooperativeYield();
+  }
+
+  const scale = printScale(width, height);
+  const pixelAreaMm2 = ARTWORK_WIDTH_MM * ARTWORK_HEIGHT_MM / labels.length;
+  const { semantic, halo } = buildSemanticNoiseMasks(width, height, semanticRegions);
+  const eligible = new Uint8Array(components.length);
+  const diagnostics: NonSemanticNoiseCorrectionDiagnostics = {
+    correctedComponentCount: 0,
+    correctedPixelCount: 0,
+    correctedAreaMm2: 0,
+    correctedAreaPercent: 0,
+    skippedSemanticCount: 0,
+    skippedTooLargeCount: 0,
+    skippedNoNeighborCount: 0,
+    skippedOnlyColorCount: 0,
+    semanticFailCountAfter: 0,
+    nonSemanticFailCountAfter: 0,
+    semanticPixelChangeCount: 0,
+  };
+
+  for (let id = 0; id < components.length; id++) {
+    const component = components[id];
+    const placement = findNumberPlacement(
+      component,
+      width,
+      component.label,
+      componentDistance(component, width),
+      componentMask(component, width),
+      componentOrientation(component, width),
+      scale,
+    );
+    if (placement) continue;
+    if (component.pixels.some((pixel) => semantic[pixel] || halo[pixel])) {
+      diagnostics.skippedSemanticCount++;
+      continue;
+    }
+    const areaMm2 = component.pixels.length * pixelAreaMm2;
+    if (areaMm2 >= 4) {
+      diagnostics.skippedTooLargeCount++;
+      continue;
+    }
+    if (labelPixelCounts[component.label] === component.pixels.length) {
+      diagnostics.skippedOnlyColorCount++;
+      continue;
+    }
+    if (!adjacency.get(id)?.size) {
+      diagnostics.skippedNoNeighborCount++;
+      continue;
+    }
+    eligible[id] = 1;
+    await cooperativeYield();
+  }
+
+  const selectedLabs = approved.selectedRgb.map(([r, g, b]) => rgbToLab(r, g, b));
+  const replacements: Array<{ id: number; label: number }> = [];
+  for (let id = 0; id < components.length; id++) {
+    if (!eligible[id]) continue;
+    const component = components[id];
+    const neighbours = [...(adjacency.get(id)?.entries() || [])]
+      .filter(([neighbourId]) => !eligible[neighbourId])
+      .map(([neighbourId, shared]) => ({ id: neighbourId, shared, component: components[neighbourId] }))
+      .sort((left, right) => {
+        if (left.shared !== right.shared) return right.shared - left.shared;
+        const leftDistance = labDistance(selectedLabs[component.label], selectedLabs[left.component.label]);
+        const rightDistance = labDistance(selectedLabs[component.label], selectedLabs[right.component.label]);
+        if (leftDistance !== rightDistance) return leftDistance - rightDistance;
+        if (left.component.pixels.length !== right.component.pixels.length) return right.component.pixels.length - left.component.pixels.length;
+        return left.id - right.id;
+      });
+    const replacement = neighbours[0];
+    if (!replacement) {
+      diagnostics.skippedNoNeighborCount++;
+      continue;
+    }
+    replacements.push({ id, label: replacement.component.label });
+  }
+
+  const correctedLabels = labels.slice();
+  for (const replacement of replacements) {
+    const component = components[replacement.id];
+    const [r, g, b] = approved.selectedRgb[replacement.label];
+    for (const pixel of component.pixels) {
+      const target = pixel * 4;
+      imageData.data[target] = r;
+      imageData.data[target + 1] = g;
+      imageData.data[target + 2] = b;
+      correctedLabels[pixel] = replacement.label;
+      if (semantic[pixel]) diagnostics.semanticPixelChangeCount++;
+    }
+    diagnostics.correctedComponentCount++;
+    diagnostics.correctedPixelCount += component.pixels.length;
+    await cooperativeYield();
+  }
+  diagnostics.correctedAreaMm2 = diagnostics.correctedPixelCount * pixelAreaMm2;
+  diagnostics.correctedAreaPercent = diagnostics.correctedPixelCount / labels.length * 100;
+  await walkComponents(correctedLabels, width, height, approved.selectedPaints.length, (component) => {
+    const placement = findNumberPlacement(
+      component,
+      width,
+      component.label,
+      componentDistance(component, width),
+      componentMask(component, width),
+      componentOrientation(component, width),
+      scale,
+    );
+    if (placement) return;
+    if (component.pixels.some((pixel) => semantic[pixel])) diagnostics.semanticFailCountAfter++;
+    else diagnostics.nonSemanticFailCountAfter++;
+  }, cooperativeYield);
+  if (!diagnostics.correctedComponentCount) return { correctedRaster: fileUrl, diagnostics };
+  context.putImageData(imageData, 0, 0);
+  return { correctedRaster: canvas.toDataURL("image/png"), diagnostics };
 }
 
 export async function validateProductionReadiness(
