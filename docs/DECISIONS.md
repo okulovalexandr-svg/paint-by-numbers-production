@@ -41,5 +41,11 @@ Validator-guided production correction may run only on a failed palette-ready pr
 ## D-013 — The approved Final Region Map remains immutable
 After a corrected preview passes production readiness and is visually approved, that exact approved Final Region Map remains immutable. Downstream contours, numbering, SVG and PDF derive from it without correction, cleanup, recoloring or resegmentation.
 
+## D-014 — Phase A2 selects correction guidance from readiness coverage
+Production correction remains one explicit user-triggered AI edit before approval. When current 5 pt fit coverage is below 25%, the AI receives `global-rebuild` guidance that treats the original source as the preferred identity/composition reference and reconstructs a globally over-fragmented preview into broader coherent paint regions. At 25% coverage or above, it receives `local-repair` guidance that preserves good regions and repairs highlighted failures locally. This split changes AI guidance only; validator thresholds and the deterministic post-AI pipeline remain unchanged.
+
+## D-015 — A selected production palette is an allowed set
+Production-correction output may use only colors from the selected production palette, but it does not have to use every listed color. A rarely used color must never be forced into tiny regions merely to keep that color visible.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
