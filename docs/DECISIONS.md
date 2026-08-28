@@ -23,5 +23,8 @@ When output is wrong, identify the first pipeline stage where it diverges from t
 ## D-007 — Development should be regression-driven
 Once the Golden Reference artifacts are committed, changes must be checked against them so a fix cannot silently break previously correct behavior.
 
+## D-008 — Approved previews must pass production readiness before approval
+A palette-ready preview may be approved only when every 4-connected visible region fits the exact production 5 pt number test. A validated approved map is the immutable Final Region Map; production SVG/PDF generation must not merge, recolor, clean or resegment it.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

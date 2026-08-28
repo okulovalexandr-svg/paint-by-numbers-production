@@ -20,7 +20,49 @@ export type SemanticRegion = {
 export type PaintProcessOptions = {
   semanticRegions?: SemanticRegion[];
   preserveSemanticDetails?: boolean;
+  productionReadiness?: ProductionReadinessResult;
   onProgress?: (stage: string, progress: number) => void;
+};
+
+export type ProductionReadinessStatus = "PASS" | "WARN" | "FAIL";
+
+export type ProductionReadinessPhysicalMetrics = {
+  min: number;
+  p10: number;
+  p25: number;
+  median: number;
+  p75: number;
+  p90: number;
+  max: number;
+};
+
+export type ProductionReadinessResult = {
+  width: number;
+  height: number;
+  regionCount: number;
+  fitCount: number;
+  failCount: number;
+  fitCoverage: number;
+  failedAreaPixels: number;
+  failedAreaMm2: number;
+  failedAreaPercent: number;
+  densityPer100Cm2: number;
+  failedAreaBuckets: {
+    "<1": number;
+    "1-2": number;
+    "2-4": number;
+    "4-8": number;
+    "8-16": number;
+    ">16": number;
+  };
+  failedBBoxWidthMm: ProductionReadinessPhysicalMetrics;
+  failedBBoxHeightMm: ProductionReadinessPhysicalMetrics;
+  microIslandFailCount: number;
+  status: ProductionReadinessStatus;
+};
+
+export type ProductionReadinessOptions = {
+  semanticAvailable?: boolean;
 };
 
 export type PaintProcessResult = {
@@ -97,6 +139,42 @@ function printScale(width: number, height: number): PrintScale {
     minimumFontPx: 5 * POINT_TO_MM * pixelsPerMm,
     maximumFontPx: 8 * POINT_TO_MM * pixelsPerMm,
     contourWidthPx: 0.25 * POINT_TO_MM * pixelsPerMm,
+  };
+}
+
+function approvedPaletteAssignment(rgb: Uint8ClampedArray, palette: ProductionPaint[]) {
+  const counts = new Map<number, number>();
+  for (let pixel = 0; pixel < rgb.length; pixel += 3) {
+    const key = (rgb[pixel] << 16) | (rgb[pixel + 1] << 8) | rgb[pixel + 2];
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  if (counts.size > 80) throw new Error("Approved preview must contain no more than 80 flat colors");
+
+  const paletteByHex = new Map(palette.map((paint, index) => [paint.hex.toUpperCase(), { paint, index }]));
+  const colors = [...counts.entries()].map(([key, count]) => {
+    const color: [number, number, number] = [(key >> 16) & 255, (key >> 8) & 255, key & 255];
+    const hex = `#${color.map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+    const exact = paletteByHex.get(hex);
+    return { key, count, rgb: color, hex, exact };
+  }).sort((left, right) => {
+    if (left.exact && right.exact) return left.exact.index - right.exact.index;
+    if (left.exact) return -1;
+    if (right.exact) return 1;
+    const lightLeft = left.rgb[0] * .2126 + left.rgb[1] * .7152 + left.rgb[2] * .0722;
+    const lightRight = right.rgb[0] * .2126 + right.rgb[1] * .7152 + right.rgb[2] * .0722;
+    return lightRight - lightLeft || right.count - left.count;
+  });
+  const assignment = new Map<number, number>();
+  colors.forEach((color, index) => assignment.set(color.key, index));
+  return {
+    selectedPaints: colors.map((color) => color.exact?.paint || {
+      id: 1_000_000 + color.key,
+      code: color.hex,
+      name: "Цвет утверждённого превью",
+      hex: color.hex,
+    }),
+    selectedRgb: colors.map((color) => color.rgb),
+    assignment,
   };
 }
 
@@ -1388,6 +1466,141 @@ async function collectNumberMarks(
   };
 }
 
+function physicalMetricSummary(values: number[]): ProductionReadinessPhysicalMetrics {
+  if (!values.length) return { min: 0, p10: 0, p25: 0, median: 0, p75: 0, p90: 0, max: 0 };
+  const sorted = [...values].sort((left, right) => left - right);
+  const at = (ratio: number) => {
+    const position = (sorted.length - 1) * ratio;
+    const lower = Math.floor(position);
+    const upper = Math.ceil(position);
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+  };
+  return {
+    min: sorted[0],
+    p10: at(.1),
+    p25: at(.25),
+    median: at(.5),
+    p75: at(.75),
+    p90: at(.9),
+    max: sorted[sorted.length - 1],
+  };
+}
+
+export async function validateProductionReadiness(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  options: ProductionReadinessOptions = {},
+): Promise<ProductionReadinessResult> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const cooperativeYield = createCooperativeYield();
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const resizeScale = Math.min(1, 3000 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * resizeScale));
+  const height = Math.max(1, Math.round(image.height * resizeScale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, width, height);
+  const rgba = context.getImageData(0, 0, width, height).data;
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    if (rgba[pixel * 4 + 3] !== 255) throw new Error("Production-ready preview must be fully opaque");
+    rgb[pixel * 3] = rgba[pixel * 4];
+    rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1];
+    rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2];
+    if ((pixel & 131071) === 0) await cooperativeYield();
+  }
+
+  const approved = approvedPaletteAssignment(rgb, palette);
+  const labels = new Uint8Array(width * height);
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    const key = (rgb[pixel * 3] << 16) | (rgb[pixel * 3 + 1] << 8) | rgb[pixel * 3 + 2];
+    labels[pixel] = approved.assignment.get(key) ?? 0;
+  }
+
+  const scale = printScale(width, height);
+  const pixelAreaMm2 = ARTWORK_WIDTH_MM * ARTWORK_HEIGHT_MM / labels.length;
+  const pixelWidthMm = ARTWORK_WIDTH_MM / width;
+  const pixelHeightMm = ARTWORK_HEIGHT_MM / height;
+  const failedAreaBuckets: ProductionReadinessResult["failedAreaBuckets"] = {
+    "<1": 0,
+    "1-2": 0,
+    "2-4": 0,
+    "4-8": 0,
+    "8-16": 0,
+    ">16": 0,
+  };
+  const failedWidths: number[] = [];
+  const failedHeights: number[] = [];
+  let regionCount = 0;
+  let fitCount = 0;
+  let failedAreaPixels = 0;
+  await walkComponents(labels, width, height, approved.selectedPaints.length, async (component) => {
+    regionCount++;
+    const placement = findNumberPlacement(
+      component,
+      width,
+      component.label,
+      componentDistance(component, width),
+      componentMask(component, width),
+      componentOrientation(component, width),
+      scale,
+    );
+    if (placement) {
+      fitCount++;
+      return;
+    }
+    failedAreaPixels += component.pixels.length;
+    const areaMm2 = component.pixels.length * pixelAreaMm2;
+    const bucket = areaMm2 < 1 ? "<1"
+      : areaMm2 < 2 ? "1-2"
+      : areaMm2 < 4 ? "2-4"
+      : areaMm2 < 8 ? "4-8"
+      : areaMm2 <= 16 ? "8-16"
+      : ">16";
+    failedAreaBuckets[bucket]++;
+    failedWidths.push((component.maxX - component.minX + 1) * pixelWidthMm);
+    failedHeights.push((component.maxY - component.minY + 1) * pixelHeightMm);
+    await cooperativeYield();
+  }, cooperativeYield);
+
+  const failCount = regionCount - fitCount;
+  const fitCoverage = regionCount ? fitCount / regionCount * 100 : 100;
+  const failedAreaMm2 = failedAreaPixels * pixelAreaMm2;
+  const failedAreaPercent = failedAreaPixels / labels.length * 100;
+  const artworkAreaCm2 = ARTWORK_WIDTH_MM * ARTWORK_HEIGHT_MM / 100;
+  const densityPer100Cm2 = regionCount / (artworkAreaCm2 / 100);
+  const hardFailure = failCount >= 1 || fitCoverage < 100 || failedAreaPercent > 0;
+  const status: ProductionReadinessStatus = hardFailure
+    ? "FAIL"
+    : densityPer100Cm2 > 50 || options.semanticAvailable === false
+      ? "WARN"
+      : "PASS";
+
+  return {
+    width,
+    height,
+    regionCount,
+    fitCount,
+    failCount,
+    fitCoverage,
+    failedAreaPixels,
+    failedAreaMm2,
+    failedAreaPercent,
+    densityPer100Cm2,
+    failedAreaBuckets,
+    failedBBoxWidthMm: physicalMetricSummary(failedWidths),
+    failedBBoxHeightMm: physicalMetricSummary(failedHeights),
+    microIslandFailCount: failedAreaBuckets["<1"] + failedAreaBuckets["1-2"] + failedAreaBuckets["2-4"] + failedAreaBuckets["4-8"],
+    status,
+  };
+}
+
 export async function processPaintImage(
   fileUrl: string,
   palette: ProductionPaint[],
@@ -1414,10 +1627,22 @@ export async function processPaintImage(
   const width = Math.max(1, Math.round(image.width * resizeScale));
   const height = Math.max(1, Math.round(image.height * resizeScale));
   const physicalScale = printScale(width, height);
-  const protectionMask = mode !== "source" && options.preserveSemanticDetails
+  const readiness = mode === "approved" ? options.productionReadiness : undefined;
+  const immutableApprovedMap = Boolean(
+    readiness
+    && readiness.failCount === 0
+    && readiness.fitCoverage === 100
+    && readiness.failedAreaPercent === 0
+    && readiness.width === width
+    && readiness.height === height,
+  );
+  if (readiness && !immutableApprovedMap) {
+    throw new Error("Production readiness does not match the approved preview");
+  }
+  const protectionMask = mode !== "source" && !immutableApprovedMap && options.preserveSemanticDetails
     ? buildSemanticProtectionMask(width, height, options.semanticRegions || [])
     : undefined;
-  const criticalDetailRegionMask = mode !== "source" && options.preserveSemanticDetails
+  const criticalDetailRegionMask = mode !== "source" && !immutableApprovedMap && options.preserveSemanticDetails
     ? buildCriticalDetailMask(width, height, options.semanticRegions || [])
     : undefined;
   // Merging and final numbering must use the exact same exclusion geometry.
@@ -1457,34 +1682,10 @@ export async function processPaintImage(
     // Approved previews from the project history contain 41–45 intentional
     // flat colors. Preserve every one of them instead of forcing the image
     // through the 28-color NEW174 subset.
-    const counts = new Map<number, number>();
-    for (let pixel = 0; pixel < smoothed.length; pixel += 3) {
-      const key = (smoothed[pixel] << 16) | (smoothed[pixel + 1] << 8) | smoothed[pixel + 2];
-      counts.set(key, (counts.get(key) || 0) + 1);
-    }
-    if (counts.size > 80) throw new Error("Approved preview must contain no more than 80 flat colors");
-    const paletteByHex = new Map(palette.map((paint, index) => [paint.hex.toUpperCase(), { paint, index }]));
-    const colors = [...counts.entries()].map(([key, count]) => {
-      const rgb: [number, number, number] = [(key >> 16) & 255, (key >> 8) & 255, key & 255];
-      const hex = `#${rgb.map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
-      const exact = paletteByHex.get(hex);
-      return { key, count, rgb, hex, exact };
-    }).sort((a, b) => {
-      if (a.exact && b.exact) return a.exact.index - b.exact.index;
-      if (a.exact) return -1;
-      if (b.exact) return 1;
-      const lightA = a.rgb[0] * .2126 + a.rgb[1] * .7152 + a.rgb[2] * .0722;
-      const lightB = b.rgb[0] * .2126 + b.rgb[1] * .7152 + b.rgb[2] * .0722;
-      return lightB - lightA || b.count - a.count;
-    });
-    selectedPaints = colors.map((color) => color.exact?.paint || {
-      id: 1_000_000 + color.key,
-      code: color.hex,
-      name: "Цвет утверждённого превью",
-      hex: color.hex,
-    });
-    selectedRgb = colors.map((color) => color.rgb);
-    colors.forEach((color, index) => assignment.set(color.key, index));
+    const approved = approvedPaletteAssignment(smoothed, palette);
+    selectedPaints = approved.selectedPaints;
+    selectedRgb = approved.selectedRgb;
+    for (const [key, label] of approved.assignment) assignment.set(key, label);
   } else if (mode === "ai-approved") {
     // The AI preview already defines the geometry. Snap its pixels directly to
     // the selected production paints, but never smooth, re-cluster or redraw
@@ -1539,7 +1740,7 @@ export async function processPaintImage(
     removedAreas += await mergeUnnumberableAreas(labels, width, height, selectedPaints.length, selectedLabs, physicalScale, 3, undefined, undefined, undefined, cooperativeYield);
     labels = majorityCleanup(labels, width, height, selectedPaints.length, edges);
     removedAreas += await mergeUnnumberableAreas(labels, width, height, selectedPaints.length, selectedLabs, physicalScale, 3, undefined, undefined, undefined, cooperativeYield);
-  } else {
+  } else if (!immutableApprovedMap) {
     // This is the decisive FT154/FT155 production rule: detail survives until
     // a region demonstrably cannot contain its real 5 pt paint number. Only
     // then is it merged into the nearest suitable neighbour. Their accepted
@@ -1573,6 +1774,11 @@ export async function processPaintImage(
         );
       },
     );
+  } else {
+    // The pre-approval validator has already proved that every connected
+    // region fits the real 5 pt number. Keep this exact label map immutable:
+    // no merge, recoloring, cleanup or protected-detail reconstruction.
+    await report("Используем проверенную неизменяемую карту областей…", 66);
   }
   const detailRestoreMask = new Uint8Array(labels.length);
   if (sourceLabelsForDetails && criticalDetailRegionMask) {
@@ -1639,6 +1845,12 @@ export async function processPaintImage(
 
   const numbering = await collectNumberMarks(labels, width, height, usedPaints.length, physicalScale, protectionMask, finalNumberExclusionMask, cooperativeYield);
   const marks = numbering.marks;
+  if (immutableApprovedMap && readiness && (
+    numbering.regionCount !== readiness.regionCount
+    || marks.length !== readiness.fitCount
+  )) {
+    throw new Error("Validated Final Region Map changed before production export");
+  }
   // Normalize the raster proof to the historical 40 x 50 cm Golden canvas.
   // Production SVG/PDF keep using the original working coordinates below.
   const schemeWidth = 2400;

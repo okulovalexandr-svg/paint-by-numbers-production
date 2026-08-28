@@ -13,6 +13,8 @@ import {
   processPaintImage,
   selectProductionColors,
   snapImageToProductionPalette,
+  validateProductionReadiness,
+  type ProductionReadinessResult,
   type SemanticRegion,
 } from "../lib/paint-processor";
 import { productionPalette } from "../lib/production-palette";
@@ -165,6 +167,10 @@ const detailKindLabels: Record<SemanticRegion["kind"], string> = {
   face: "Лицо",
   hand: "Рука",
 };
+
+function productionReadinessFailure(result: ProductionReadinessResult) {
+  return `Превью не готово к производству: всего областей — ${result.regionCount}; без размещения 5 pt — ${result.failCount}; покрытие — ${result.fitCoverage.toFixed(2)}%; проблемная площадь — ${result.failedAreaPercent.toFixed(3)}%; плотность — ${result.densityPer100Cm2.toFixed(2)}/100 см². Исправьте превью перед утверждением.`;
+}
 
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
@@ -705,6 +711,11 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       setProcessingStage("Распознаём глаза, надписи и важные детали…");
       const palettePreview = await snapImageToProductionPalette(payload.image, selectedProductionPalette);
       const semantic = await analyzeSemanticPreview(palettePreview);
+      setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
+      const readiness = await validateProductionReadiness(palettePreview, selectedProductionPalette, {
+        semanticAvailable: semantic.regions.length > 0,
+      });
+      if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем единую карту областей из ИИ-превью…");
       const result = await processPaintImage(
         palettePreview,
@@ -712,6 +723,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         selectedProductionPalette.length,
         "approved",
         {
+          productionReadiness: readiness,
           preserveSemanticDetails: true,
           semanticRegions: semantic.regions,
           onProgress: (stage, progress) => {
@@ -829,6 +841,11 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const semantic = activeProject.semanticRegions?.length
         ? { regions: activeProject.semanticRegions, costUsd: activeProject.semanticAnalysisCostUsd || 0 }
         : await analyzeSemanticPreview(paletteReadyPreview);
+      setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
+      const readiness = await validateProductionReadiness(paletteReadyPreview, aiPalette, {
+        semanticAvailable: semantic.regions.length > 0,
+      });
+      if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
       setProcessingStage("Фиксируем загруженное превью как единую карту областей…");
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const result = await processPaintImage(
@@ -837,6 +854,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         aiPalette.length,
         "approved",
         {
+          productionReadiness: readiness,
           preserveSemanticDetails: true,
           semanticRegions: semantic.regions,
           onProgress: (stage, progress) => {
