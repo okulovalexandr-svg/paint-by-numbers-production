@@ -110,7 +110,7 @@ function relayImageRequest(execute: () => Promise<OpenAiImageOutcome>) {
   });
 }
 
-function buildPrompt(targetColors: number, profile: string, correction: string, palette: PromptPaint[], hasReference: boolean) {
+function buildPrompt(targetColors: number, profile: string, correction: string, palette: PromptPaint[], hasReference: boolean, mode: string) {
   const subjectRules: Record<string, string> = {
     portrait: "Build the people first. Faces, identity, eyes, pupils, eyelids, eyebrows, nose planes, lips, ears, hairline, hands, fingers, clothing folds, jewelry and every recognizable accessory are protected details.",
     animal: "Build the animal first. Eyes, highlights, pupils, eyelids, nose, nostrils, mouth, ears, whisker roots, paws, claws and characteristic coat markings are protected details.",
@@ -118,6 +118,31 @@ function buildPrompt(targetColors: number, profile: string, correction: string, 
     auto: "Detect every meaningful subject before simplifying anything. Protect faces, eyes, hands, animals, lettering, emblems, logos, signs, jewelry, accessories and every identity- or story-defining small object.",
   };
   const paletteList = palette.map((paint, index) => `${index + 1}. ${paint.code} · ${paint.name} · ${paint.hex}`).join("\n");
+
+  if (mode === "production-correction") {
+    return `
+You are correcting an existing palette-ready paint-by-numbers preview for production.
+
+INPUTS
+- Image 1 is the current failed color preview and is the primary image to edit.
+- Image 2 is a diagnostic failure overlay made from the exact failed 4-connected regions. Magenta marks semantic failures; orange marks nonsemantic failures. It is reference-only and must never appear in the result.
+${hasReference ? "- Image 3 is the original source reference. Use it only to preserve identity and meaningful details." : ""}
+
+REQUIRED CORRECTION
+- Preserve the exact composition, crop, faces, identity, poses, proportions and major forms from Image 1.
+- Preserve already-good large paint regions. Rework primarily the regions highlighted in Image 2.
+- Merge unnecessary local tonal fragmentation into larger coherent paint regions.
+- Keep meaningful details—eyes, lips, fingers, fur markings, text and logos—recognizable, but rebuild them from larger coherent paint regions.
+- Avoid dots, slivers, rings, crumbs, isolated flecks, gradients, noise, dithering and anti-aliased color fragments.
+- Every visible 4-connected paint region must physically fit one internal production number at 5 pt or larger.
+- Use only the exact solid colors in the selected production palette below. Do not add, remove or replace palette colors.
+- Do not add numbers, contours, leader lines, annotations, overlay colors or diagnostic marks.
+
+SELECTED PRODUCTION PALETTE (${targetColors} colors)
+${paletteList}
+
+Return only the corrected full-frame color preview.`.trim();
+  }
 
   return `
 You are preparing a professional paint-by-numbers production preview for Hobruk.
@@ -197,11 +222,24 @@ export async function POST(request: Request) {
   }
   if (!promptPalette.length) return Response.json({ error: "production palette is required" }, { status: 400 });
   const profile = String(data.get("profile") || "auto");
+  const mode = data.get("mode") === "production-correction" ? "production-correction" : "standard";
   const correction = String(data.get("correction") || "").slice(0, 2000);
   const quality = data.get("quality") === "medium" ? "medium" : "high";
 
+  const failureOverlay = data.get("failureOverlay");
+  if (mode === "production-correction" && !(failureOverlay instanceof File)) {
+    return Response.json({ error: "production failure overlay is required" }, { status: 400 });
+  }
+  if (failureOverlay instanceof File && (!allowedTypes.has(failureOverlay.type) || failureOverlay.size > 25 * 1024 * 1024)) {
+    return Response.json({ error: "invalid production failure overlay" }, { status: 415 });
+  }
+  const sourceReference = data.get("sourceReference");
+  if (sourceReference instanceof File && (!allowedTypes.has(sourceReference.type) || sourceReference.size > 25 * 1024 * 1024)) {
+    return Response.json({ error: "invalid source reference" }, { status: 415 });
+  }
+
   let reference: Blob | null = null;
-  if (quality === "high") {
+  if (quality === "high" && mode !== "production-correction") {
     try {
       const referenceResponse = await fetch(new URL("/reference/history/style-reference.jpg", request.url));
       if (referenceResponse.ok) {
@@ -216,8 +254,13 @@ export async function POST(request: Request) {
     const openaiForm = new FormData();
     openaiForm.set("model", "gpt-image-2");
     openaiForm.append("image[]", image, image.name || "source.jpg");
-    if (reference) openaiForm.append("image[]", reference, "hobruk-style-reference.jpg");
-    openaiForm.set("prompt", buildPrompt(promptPalette.length, profile, correction, promptPalette, Boolean(reference)));
+    if (mode === "production-correction") {
+      openaiForm.append("image[]", failureOverlay as File, "production-failure-overlay.png");
+      if (sourceReference instanceof File) openaiForm.append("image[]", sourceReference, sourceReference.name || "original-source.jpg");
+    } else if (reference) {
+      openaiForm.append("image[]", reference, "hobruk-style-reference.jpg");
+    }
+    openaiForm.set("prompt", buildPrompt(promptPalette.length, profile, correction, promptPalette, mode === "production-correction" ? sourceReference instanceof File : Boolean(reference), mode));
     openaiForm.set("quality", quality);
     openaiForm.set("size", standardCompatibility ? "1024x1536" : quality === "medium" ? "800x1008" : "1024x1280");
     openaiForm.set("stream", "true");

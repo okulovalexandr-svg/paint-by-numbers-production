@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import {
+  createProductionFailureOverlay,
   correctNonSemanticGeometry,
   correctNonSemanticNoise,
   processPaintImage,
@@ -62,6 +63,10 @@ type Project = {
   aiCostUsd?: number;
   lastAiCostUsd?: number;
   aiGenerationCount?: number;
+  productionReadiness?: ProductionReadinessResult;
+  productionFailureOverlayUrl?: string;
+  semanticFailCount?: number;
+  nonSemanticFailCount?: number;
 };
 
 type TemplateKind = "canvas" | "sticker";
@@ -371,6 +376,13 @@ async function analyzeSemanticPreview(imageUrl: string) {
   return { regions: payload.regions, costUsd: payload.costUsd || 0 };
 }
 
+async function imageUrlFile(imageUrl: string, name: string) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error("Не удалось открыть изображение для производственной коррекции");
+  const blob = await response.blob();
+  return new File([blob], name, { type: blob.type || "image/png" });
+}
+
 export default function Studio({ viewer }: { viewer: { name: string; email: string } }) {
   const [section, setSection] = useState<Section>("projects");
   const [projects, setProjects] = useState(initialProjects);
@@ -458,6 +470,53 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
     window.setTimeout(() => setToast(""), 2800);
   }
 
+  async function readinessFailureProject(
+    base: Project,
+    failedRaster: string,
+    selectedPalette: PaintColor[],
+    semanticRegions: SemanticRegion[],
+    readiness: ProductionReadinessResult,
+    costUpdate: { semanticCostUsd?: number; operationCostUsd?: number; generationIncrement?: number } = {},
+  ) {
+    const overlay = await createProductionFailureOverlay(failedRaster, selectedPalette, semanticRegions);
+    if (overlay.semanticFailCount + overlay.nonSemanticFailCount !== readiness.failCount) {
+      throw new Error("Диагностический overlay не совпал с production readiness result");
+    }
+    const operationCost = costUpdate.operationCostUsd || 0;
+    return {
+      ...base,
+      aiPreviewUrl: failedRaster,
+      previewUrl: failedRaster,
+      aiPalette: selectedPalette,
+      productionReadiness: readiness,
+      productionFailureOverlayUrl: overlay.overlay,
+      semanticFailCount: overlay.semanticFailCount,
+      nonSemanticFailCount: overlay.nonSemanticFailCount,
+      productionPreviewUrl: undefined,
+      productionSchemeUrl: undefined,
+      productionSvgUrl: undefined,
+      productionPdfUrl: undefined,
+      approvedPreviewUrl: undefined,
+      schemeUrl: undefined,
+      svgUrl: undefined,
+      pdfUrl: undefined,
+      checkpointId: undefined,
+      usedColorIds: undefined,
+      usedPaints: undefined,
+      regionCount: readiness.regionCount,
+      numberCount: readiness.fitCount,
+      unlabeledRegionCount: readiness.failCount,
+      semanticRegions,
+      semanticPreviewUrl: failedRaster,
+      semanticAnalysisCostUsd: costUpdate.semanticCostUsd ?? base.semanticAnalysisCostUsd,
+      aiCostUsd: Number(((base.aiCostUsd || 0) + operationCost).toFixed(6)),
+      lastAiCostUsd: operationCost ? Number(operationCost.toFixed(6)) : base.lastAiCostUsd,
+      aiGenerationCount: (base.aiGenerationCount || 0) + (costUpdate.generationIncrement || 0),
+      status: "Нужны правки" as ProjectStatus,
+      updated: "Превью требует производственной коррекции",
+    };
+  }
+
   function downloadProduction(format: "svg" | "pdf") {
     const url = format === "svg" ? activeProject.svgUrl : activeProject.pdfUrl;
     if (!url || !activeProject.approvedPreviewUrl) {
@@ -502,7 +561,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
     setProductionError("");
     const sourceUrl = URL.createObjectURL(file);
     setShowAiDraft(false);
-    const updated = { ...activeProject, sourceUrl, aiPreviewUrl: undefined, aiPalette: undefined, productionPreviewUrl: undefined, productionSchemeUrl: undefined, productionSvgUrl: undefined, productionPdfUrl: undefined, approvedPreviewUrl: undefined, previewUrl: undefined, schemeUrl: undefined, svgUrl: undefined, pdfUrl: undefined, checkpointId: undefined, usedColorIds: undefined, usedPaints: undefined, regionCount: undefined, numberCount: undefined, removedAreas: undefined, unlabeledRegionCount: undefined, stackedNumberCount: undefined, repairedRegionCount: undefined, protectedRegionCount: undefined, minimumRegionArea: undefined, semanticRegions: undefined, semanticPreviewUrl: undefined, semanticAnalysisCostUsd: undefined, aiCostUsd: 0, lastAiCostUsd: undefined, aiGenerationCount: 0, status: "Черновик" as ProjectStatus };
+    const updated = { ...activeProject, sourceUrl, aiPreviewUrl: undefined, aiPalette: undefined, productionPreviewUrl: undefined, productionSchemeUrl: undefined, productionSvgUrl: undefined, productionPdfUrl: undefined, approvedPreviewUrl: undefined, previewUrl: undefined, schemeUrl: undefined, svgUrl: undefined, pdfUrl: undefined, checkpointId: undefined, usedColorIds: undefined, usedPaints: undefined, regionCount: undefined, numberCount: undefined, removedAreas: undefined, unlabeledRegionCount: undefined, stackedNumberCount: undefined, repairedRegionCount: undefined, protectedRegionCount: undefined, minimumRegionArea: undefined, semanticRegions: undefined, semanticPreviewUrl: undefined, semanticAnalysisCostUsd: undefined, productionReadiness: undefined, productionFailureOverlayUrl: undefined, semanticFailCount: undefined, nonSemanticFailCount: undefined, aiCostUsd: 0, lastAiCostUsd: undefined, aiGenerationCount: 0, status: "Черновик" as ProjectStatus };
     setActiveProject(updated);
     setProjects((items) => items.map((item) => item.id === updated.id ? updated : item));
     setSection("editor");
@@ -548,6 +607,10 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       semanticRegions: undefined,
       semanticPreviewUrl: undefined,
       semanticAnalysisCostUsd: undefined,
+      productionReadiness: undefined,
+      productionFailureOverlayUrl: undefined,
+      semanticFailCount: undefined,
+      nonSemanticFailCount: undefined,
       status: "Нужны правки",
     };
     setActiveProject(updated);
@@ -660,6 +723,10 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       checkpointId: undefined,
       regionCount: undefined,
       numberCount: undefined,
+      productionReadiness: undefined,
+      productionFailureOverlayUrl: undefined,
+      semanticFailCount: undefined,
+      nonSemanticFailCount: undefined,
       status: "Нужны правки",
       updated: "Защищённые детали проверены",
     };
@@ -708,6 +775,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const payload = await intelligentPreviewPayload(response, () => notify("ИИ закончил черновой проход — уточняем детали…"));
       if (response.status === 413) throw new Error("Фотография не прошла подготовку. Попробуйте загрузить её ещё раз.");
       if (!response.ok || !payload.image) throw new Error(payload.error || "Не удалось создать ИИ-превью");
+      const generationCost = typeof payload.costUsd === "number" ? payload.costUsd : 0;
       setIsProcessing(true);
       setProcessingProgress(4);
       setProcessingStage("Распознаём глаза, надписи и важные детали…");
@@ -721,7 +789,23 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, selectedProductionPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
-      if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
+      if (readiness.status === "FAIL") {
+        const failed = await readinessFailureProject(
+          activeProject,
+          geometryCorrection.correctedRaster,
+          selectedProductionPalette,
+          semantic.regions,
+          readiness,
+          { semanticCostUsd: semantic.costUsd, operationCostUsd: generationCost + semantic.costUsd, generationIncrement: 1 },
+        );
+        setActiveProject(failed);
+        setProjects((items) => items.map((item) => item.id === failed.id ? failed : item));
+        setShowAiDraft(true);
+        setAiSettingsOpen(false);
+        setProductionError(productionReadinessFailure(readiness));
+        notify("Превью сохранено: требуется производственная коррекция");
+        return;
+      }
       setProcessingStage("Фиксируем единую карту областей из ИИ-превью…");
       const result = await processPaintImage(
         geometryCorrection.correctedRaster,
@@ -741,7 +825,6 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       if (result.unlabeledRegionCount !== 0) {
         throw new Error(`Контроль не пройден: ${result.unlabeledRegionCount} областей без цифры`);
       }
-      const generationCost = typeof payload.costUsd === "number" ? payload.costUsd : 0;
       const updated: Project = {
         ...activeProject,
         // What the user sees is already the immutable colour map used by SVG
@@ -774,6 +857,10 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         aiCostUsd: Number(((activeProject.aiCostUsd || 0) + generationCost + semantic.costUsd).toFixed(6)),
         lastAiCostUsd: Number((generationCost + semantic.costUsd).toFixed(6)) || undefined,
         aiGenerationCount: (activeProject.aiGenerationCount || 0) + 1,
+        productionReadiness: readiness,
+        productionFailureOverlayUrl: undefined,
+        semanticFailCount: 0,
+        nonSemanticFailCount: 0,
         colors: result.usedColors.length,
         status: "Нужны правки",
         updated: "Единая производственная карта на проверке",
@@ -855,7 +942,23 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, aiPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
-      if (readiness.status === "FAIL") throw new Error(productionReadinessFailure(readiness));
+      if (readiness.status === "FAIL") {
+        const newSemanticCost = activeProject.semanticRegions?.length ? 0 : semantic.costUsd;
+        const failed = await readinessFailureProject(
+          activeProject,
+          geometryCorrection.correctedRaster,
+          aiPalette,
+          semantic.regions,
+          readiness,
+          { semanticCostUsd: semantic.costUsd, operationCostUsd: newSemanticCost },
+        );
+        setActiveProject(failed);
+        setProjects((items) => items.map((item) => item.id === failed.id ? failed : item));
+        setShowAiDraft(true);
+        setProductionError(productionReadinessFailure(readiness));
+        notify("Превью сохранено: требуется производственная коррекция");
+        return;
+      }
       setProcessingStage("Фиксируем загруженное превью как единую карту областей…");
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const result = await processPaintImage(
@@ -911,6 +1014,10 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         lastAiCostUsd: activeProject.semanticRegions?.length
           ? activeProject.lastAiCostUsd
           : semantic.costUsd || activeProject.lastAiCostUsd,
+        productionReadiness: readiness,
+        productionFailureOverlayUrl: undefined,
+        semanticFailCount: 0,
+        nonSemanticFailCount: 0,
         status: "Нужны правки",
         updated: "Производственная карта на проверке",
       };
@@ -924,6 +1031,138 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       setProductionError(message);
       notify(message);
     } finally {
+      setIsProcessing(false);
+      setProcessingStage("");
+      setProcessingProgress(0);
+    }
+  }
+
+  async function correctPreviewForProduction() {
+    const selectedProductionPalette = activeProject.aiPalette;
+    if (
+      !activeProject.aiPreviewUrl
+      || !activeProject.productionFailureOverlayUrl
+      || !selectedProductionPalette?.length
+      || activeProject.productionReadiness?.status !== "FAIL"
+    ) return;
+    if (aiConfigured === false) {
+      notify("Нужно подключить секрет OPENAI_API_KEY в настройках приложения");
+      return;
+    }
+    setIsGeneratingAi(true);
+    setAiError("");
+    setProductionError("");
+    try {
+      const body = new FormData();
+      body.set("mode", "production-correction");
+      body.set("image", await imageUrlFile(activeProject.aiPreviewUrl, "failed-production-preview.png"));
+      body.set("failureOverlay", await imageUrlFile(activeProject.productionFailureOverlayUrl, "production-failure-overlay.png"));
+      const original = await sourceFile();
+      if (original) body.set("sourceReference", original);
+      body.set("targetColors", String(selectedProductionPalette.length));
+      body.set("palette", JSON.stringify(selectedProductionPalette.map(({ code, name, hex }) => ({ code, name, hex }))));
+      body.set("profile", aiProfile);
+      body.set("quality", aiQuality);
+      const response = await fetch("/api/intelligent-preview", { method: "POST", body });
+      const payload = await intelligentPreviewPayload(response, () => notify("ИИ исправляет выделенные производственные зоны…"));
+      if (!response.ok || !payload.image) throw new Error(payload.error || "Не удалось исправить превью под производство");
+      const generationCost = typeof payload.costUsd === "number" ? payload.costUsd : 0;
+      setIsProcessing(true);
+      setProcessingProgress(4);
+      setProcessingStage("Возвращаем исправление в выбранную производственную палитру…");
+      const palettePreview = await snapImageToProductionPalette(payload.image, selectedProductionPalette);
+      setProcessingStage("Повторно проверяем важные детали…");
+      const semantic = await analyzeSemanticPreview(palettePreview);
+      setProcessingStage("Убираем безопасные шумовые микрообласти…");
+      const noiseCorrection = await correctNonSemanticNoise(palettePreview, selectedProductionPalette, semantic.regions);
+      setProcessingStage("Расширяем безопасные узкие области…");
+      const geometryCorrection = await correctNonSemanticGeometry(noiseCorrection.correctedRaster, selectedProductionPalette, semantic.regions);
+      setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
+      const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, selectedProductionPalette, {
+        semanticAvailable: semantic.regions.length > 0,
+      });
+      const operationCost = generationCost + semantic.costUsd;
+      if (readiness.status === "FAIL") {
+        const failed = await readinessFailureProject(
+          activeProject,
+          geometryCorrection.correctedRaster,
+          selectedProductionPalette,
+          semantic.regions,
+          readiness,
+          { semanticCostUsd: semantic.costUsd, operationCostUsd: operationCost, generationIncrement: 1 },
+        );
+        setActiveProject(failed);
+        setProjects((items) => items.map((item) => item.id === failed.id ? failed : item));
+        setShowAiDraft(true);
+        setProductionError(productionReadinessFailure(readiness));
+        notify("Исправленное превью сохранено, но ещё требует коррекции");
+        return;
+      }
+      setProcessingStage("Готовим исправленную карту к обычному визуальному утверждению…");
+      const result = await processPaintImage(
+        geometryCorrection.correctedRaster,
+        selectedProductionPalette,
+        selectedProductionPalette.length,
+        "approved",
+        {
+          productionReadiness: readiness,
+          preserveSemanticDetails: true,
+          semanticRegions: semantic.regions,
+          onProgress: (stage, progress) => {
+            setProcessingStage(stage);
+            setProcessingProgress(progress);
+          },
+        },
+      );
+      if (result.unlabeledRegionCount !== 0) throw new Error(`Контроль не пройден: ${result.unlabeledRegionCount} областей без цифры`);
+      const updated: Project = {
+        ...activeProject,
+        aiPreviewUrl: result.preview,
+        previewUrl: result.preview,
+        aiPalette: selectedProductionPalette,
+        productionPreviewUrl: result.preview,
+        productionSchemeUrl: result.scheme,
+        productionSvgUrl: result.svg,
+        productionPdfUrl: result.pdf,
+        approvedPreviewUrl: undefined,
+        schemeUrl: undefined,
+        svgUrl: undefined,
+        pdfUrl: undefined,
+        checkpointId: result.checkpointId,
+        usedColorIds: result.usedColors.map((paint) => paint.id),
+        usedPaints: result.usedColors,
+        regionCount: result.regionCount,
+        numberCount: result.numberCount,
+        removedAreas: result.removedAreas,
+        unlabeledRegionCount: result.unlabeledRegionCount,
+        stackedNumberCount: result.stackedNumberCount,
+        repairedRegionCount: result.repairedRegionCount,
+        protectedRegionCount: result.protectedRegionCount,
+        minimumRegionArea: result.minimumRegionArea,
+        semanticRegions: semantic.regions,
+        semanticPreviewUrl: geometryCorrection.correctedRaster,
+        semanticAnalysisCostUsd: semantic.costUsd,
+        aiCostUsd: Number(((activeProject.aiCostUsd || 0) + operationCost).toFixed(6)),
+        lastAiCostUsd: Number(operationCost.toFixed(6)) || undefined,
+        aiGenerationCount: (activeProject.aiGenerationCount || 0) + 1,
+        productionReadiness: readiness,
+        productionFailureOverlayUrl: undefined,
+        semanticFailCount: 0,
+        nonSemanticFailCount: 0,
+        colors: result.usedColors.length,
+        status: "Нужны правки",
+        updated: "Исправленная производственная карта на проверке",
+      };
+      setActiveProject(updated);
+      setProjects((items) => items.map((item) => item.id === updated.id ? updated : item));
+      setShowAiDraft(false);
+      notify(`Исправление прошло readiness: ${result.regionCount} областей · можно утвердить карту`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Не удалось исправить превью под производство";
+      setAiError(message);
+      notify(message);
+    } finally {
+      setIsGeneratingAi(false);
       setIsProcessing(false);
       setProcessingStage("");
       setProcessingProgress(0);
@@ -1178,6 +1417,22 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
             <div className="editor-main">
               <section className="canvas-area">
                 <div className={`workflow-note ${workflowError ? "error" : isProcessing ? "processing" : activeProject.approvedPreviewUrl ? "approved" : hasProductionMap ? "production-review" : activeProject.aiPreviewUrl ? "ai-review" : "draft"}`}><span>{productionError ? "Ошибка карты" : aiError ? "Ошибка ИИ" : isProcessing ? `Расчёт ${processingProgress}%` : activeProject.approvedPreviewUrl ? "Контрольная точка зафиксирована" : hasProductionMap ? "Единая производственная карта на проверке" : activeProject.aiPreviewUrl ? "Готовое превью" : "Выберите способ создания"}</span><p>{workflowError || (isProcessing ? processingStage || "Фиксируем единую производственную карту…" : activeProject.approvedPreviewUrl ? `Превью, SVG и PDF сохранены из одной неизменяемой карты ${activeProject.checkpointId || "областей"}. PNG контуров — только экранный просмотр.` : hasProductionMap ? `Это уже точная карта областей для будущих SVG и PDF. Глаза, текст и логотипы сохранены отдельным source-first слоем; основная карта проверена цифрами не меньше 5 pt.` : activeProject.aiPreviewUrl ? `Приложение автоматически найдёт важные детали. Кнопка «Детали» позволяет проверить и поправить их до утверждения.` : aiConfigured === false ? "Можно создать карту полностью локально за $0 или подключить OPENAI_API_KEY для более качественной единой карты." : `ИИ создаёт детальную карту с лицами и надписями; локальный этап только убирает цветовой шум, проверяет 5 pt и строит SVG/PDF.`)}</p>{isProcessing && <i className="workflow-progress" style={{ width: `${processingProgress}%` }}/>}</div>
+                {activeProject.productionReadiness?.status === "FAIL" && activeProject.productionFailureOverlayUrl && (
+                  <section className="readiness-failure" aria-label="Production readiness FAIL">
+                    <img src={activeProject.productionFailureOverlayUrl} alt="Диагностический overlay областей, не вместивших номер 5 pt"/>
+                    <div>
+                      <header><b>{activeProject.productionReadiness.regionCount} regions</b><strong>FAIL</strong></header>
+                      <dl>
+                        <div><dt>Coverage</dt><dd>{activeProject.productionReadiness.fitCoverage.toFixed(2)}%</dd></div>
+                        <div><dt>Failed area</dt><dd>{activeProject.productionReadiness.failedAreaPercent.toFixed(3)}%</dd></div>
+                        <div><dt>Semantic FAIL</dt><dd>{activeProject.semanticFailCount || 0}</dd></div>
+                        <div><dt>Nonsemantic FAIL</dt><dd>{activeProject.nonSemanticFailCount || 0}</dd></div>
+                      </dl>
+                      <p><i className="semantic-key"/> semantic <i className="nonsemantic-key"/> nonsemantic</p>
+                      <button className="primary" disabled={isProcessing || isGeneratingAi || aiConfigured === false} onClick={correctPreviewForProduction}><Icon name="spark" size={16}/>{isGeneratingAi ? "Исправляем…" : "Исправить превью под производство"}</button>
+                    </div>
+                  </section>
+                )}
                 <div className="api-cost-bar"><div><small>API по этому сюжету</small><b>${(activeProject.aiCostUsd || 0).toFixed(3)}</b></div><div><small>Генераций изображения</small><b>{activeProject.aiGenerationCount || 0}</b></div><div><small>Последняя API-операция</small><b>{activeProject.lastAiCostUsd ? `$${activeProject.lastAiCostUsd.toFixed(3)}` : "$0"}</b></div><p>API создаёт изображение и один раз распознаёт важные зоны. Палитра, области, контуры, цифры, SVG и PDF затем строятся локально за $0.</p></div>
                 <div className="canvas-tabs"><button className="active">Три вида</button><button>Превью</button><button>Схема</button><span>{activeProject.regionCount ? `${activeProject.regionCount} областей · ${activeProject.numberCount} номеров` : "LAB-подбор · границы деталей"}</span></div>
                 <div className="canvas-grid">

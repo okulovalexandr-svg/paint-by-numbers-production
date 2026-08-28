@@ -65,6 +65,12 @@ export type ProductionReadinessOptions = {
   semanticAvailable?: boolean;
 };
 
+export type ProductionFailureOverlayResult = {
+  overlay: string;
+  semanticFailCount: number;
+  nonSemanticFailCount: number;
+};
+
 export type NonSemanticNoiseCorrectionDiagnostics = {
   correctedComponentCount: number;
   correctedPixelCount: number;
@@ -2241,6 +2247,79 @@ export async function validateProductionReadiness(
     microIslandFailCount: failedAreaBuckets["<1"] + failedAreaBuckets["1-2"] + failedAreaBuckets["2-4"] + failedAreaBuckets["4-8"],
     status,
   };
+}
+
+export async function createProductionFailureOverlay(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+): Promise<ProductionFailureOverlayResult> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const cooperativeYield = createCooperativeYield();
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const resizeScale = Math.min(1, 3000 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * resizeScale));
+  const height = Math.max(1, Math.round(image.height * resizeScale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, width, height);
+  const imageData = context.getImageData(0, 0, width, height);
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    const source = pixel * 4;
+    if (imageData.data[source + 3] !== 255) throw new Error("Production-ready preview must be fully opaque");
+    rgb[pixel * 3] = imageData.data[source];
+    rgb[pixel * 3 + 1] = imageData.data[source + 1];
+    rgb[pixel * 3 + 2] = imageData.data[source + 2];
+    // Keep the diagnostic reference legible while making highlighted regions dominant.
+    imageData.data[source] = Math.round(imageData.data[source] * 0.22 + 255 * 0.78);
+    imageData.data[source + 1] = Math.round(imageData.data[source + 1] * 0.22 + 255 * 0.78);
+    imageData.data[source + 2] = Math.round(imageData.data[source + 2] * 0.22 + 255 * 0.78);
+    if ((pixel & 131071) === 0) await cooperativeYield();
+  }
+
+  const approved = approvedPaletteAssignment(rgb, palette);
+  const labels = new Uint8Array(width * height);
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    const key = (rgb[pixel * 3] << 16) | (rgb[pixel * 3 + 1] << 8) | rgb[pixel * 3 + 2];
+    labels[pixel] = approved.assignment.get(key) ?? 0;
+  }
+  const { semantic } = buildSemanticNoiseMasks(width, height, semanticRegions);
+  const scale = printScale(width, height);
+  let semanticFailCount = 0;
+  let nonSemanticFailCount = 0;
+  await walkComponents(labels, width, height, approved.selectedPaints.length, async (component) => {
+    const placement = findNumberPlacement(
+      component,
+      width,
+      component.label,
+      componentDistance(component, width),
+      componentMask(component, width),
+      componentOrientation(component, width),
+      scale,
+    );
+    if (placement) return;
+    const semanticFailure = component.pixels.some((pixel) => semantic[pixel]);
+    if (semanticFailure) semanticFailCount++;
+    else nonSemanticFailCount++;
+    const color = semanticFailure ? [214, 42, 91] : [245, 135, 31];
+    for (const pixel of component.pixels) {
+      const target = pixel * 4;
+      imageData.data[target] = color[0];
+      imageData.data[target + 1] = color[1];
+      imageData.data[target + 2] = color[2];
+      imageData.data[target + 3] = 255;
+    }
+    await cooperativeYield();
+  }, cooperativeYield);
+  context.putImageData(imageData, 0, 0);
+  return { overlay: canvas.toDataURL("image/png"), semanticFailCount, nonSemanticFailCount };
 }
 
 export async function processPaintImage(

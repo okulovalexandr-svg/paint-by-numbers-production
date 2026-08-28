@@ -32,5 +32,14 @@ Before readiness validation, a failed component may be absorbed into an adjacent
 ## D-010 — Phase C may minimally expand only non-semantic irregular regions
 After Phase B and before readiness validation, a remaining failed non-semantic component of at least 4 mm² may borrow safe adjacent pixels without changing its production color. Expansion is capped at 2 mm and `min(12 mm², 50% of target area)`, must preserve donor connectivity and its existing 5 pt placement, and never runs on semantic geometry or an approved Final Region Map.
 
+## D-011 — Missing numbers are never an accepted production outcome
+Missing internal numbers in legacy PDF output are a defect of the old application, not permissible behavior. Every visible final 4-connected region must have exactly one internal number of at least 5 pt; coverage is 100% and unlabeled is 0.
+
+## D-012 — Production correction is upstream and approval-gated
+Validator-guided production correction may run only on a failed palette-ready preview before visual approval. It must preserve the failed candidate and readiness diagnostics, requires an explicit user action for each AI edit, and cannot mutate an approved Final Region Map.
+
+## D-013 — The approved Final Region Map remains immutable
+After a corrected preview passes production readiness and is visually approved, that exact approved Final Region Map remains immutable. Downstream contours, numbering, SVG and PDF derive from it without correction, cleanup, recoloring or resegmentation.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
