@@ -124,6 +124,83 @@ export type NonSemanticGeometryCorrectionResult = {
   diagnostics: NonSemanticGeometryCorrectionDiagnostics;
 };
 
+export type RegionGraphMergeClassification =
+  | "SAFE-CANDIDATE"
+  | "SEMANTIC-RISK"
+  | "COLOR-RISK"
+  | "TOPOLOGY-RISK"
+  | "NOT-USEFUL";
+
+export type RegionGraphSemanticOverlap = {
+  kinds: Array<SemanticRegionKind | "none">;
+  ratio: number;
+};
+
+export type RegionGraphNeighbor = {
+  regionId: number;
+  sharedBoundaryPx: number;
+  sharedBoundaryMm: number;
+  labDistance: number;
+};
+
+export type RegionGraphNode = {
+  regionId: number;
+  productionColorId: number;
+  productionColorCode: string;
+  pixelArea: number;
+  areaMm2: number;
+  bboxPx: { x: number; y: number; width: number; height: number };
+  bboxMm: { x: number; y: number; width: number; height: number };
+  perimeterPx: number;
+  perimeterMm: number;
+  compactness: number;
+  minLocalWidthMm: number;
+  centroidPx: { x: number; y: number };
+  centroidMm: { x: number; y: number };
+  fits5Pt: boolean;
+  semanticOverlap: RegionGraphSemanticOverlap;
+  neighboringRegionIds: number[];
+  neighbors: RegionGraphNeighbor[];
+};
+
+export type RegionGraphEdge = {
+  regionA: number;
+  regionB: number;
+  sharedBoundaryPx: number;
+  sharedBoundaryMm: number;
+  labDistance: number;
+  mergeScore: number;
+  classification: RegionGraphMergeClassification;
+  reason: string;
+  resolvesFailedRegionIds: number[];
+};
+
+export type RegionGraphDiagnosticSummary = {
+  totalNodes: number;
+  totalEdges: number;
+  failedNodes: number;
+  semanticFailedNodes: number;
+  nonSemanticFailedNodes: number;
+  safeCandidateEdges: number;
+  failedNodesWithSafeCandidate: number;
+  failedNodesResolvableByOneSafeMerge: number;
+  semanticFailedNodesResolvableWithoutCriticalDetail: number;
+  estimatedOnePassRegionReduction: number;
+  estimatedOnePassRegionReductionPercent: number;
+  affectedAreaPercent: number;
+  semanticAreaPercentAffected: number;
+  safeCandidateLabDistances: ProductionReadinessPhysicalMetrics;
+  topRejectedReasons: Array<{ reason: string; count: number }>;
+};
+
+export type RegionGraphDiagnosticResult = {
+  width: number;
+  height: number;
+  nodes: RegionGraphNode[];
+  edges: RegionGraphEdge[];
+  summary: RegionGraphDiagnosticSummary;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -2344,6 +2421,294 @@ export async function validateProductionReadiness(
     microIslandFailCount: failedAreaBuckets["<1"] + failedAreaBuckets["1-2"] + failedAreaBuckets["2-4"] + failedAreaBuckets["4-8"],
     status,
   };
+}
+
+type RegionGraphInternalNode = {
+  component: Component;
+  semanticOwnerIds: Set<number>;
+  semanticPixelCount: number;
+};
+
+/**
+ * Builds a read-only graph from an existing 4-connected production label map.
+ * This diagnostic never mutates labels and is deliberately not called by the
+ * production processing, readiness, numbering, contour, SVG or PDF paths.
+ */
+export async function buildRegionGraphDiagnosticFromLabelMap(
+  sourceLabels: Uint8Array,
+  width: number,
+  height: number,
+  paints: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+): Promise<RegionGraphDiagnosticResult> {
+  if (width < 1 || height < 1 || sourceLabels.length !== width * height) throw new Error("Invalid region-graph label map dimensions");
+  if (!paints.length) throw new Error("Production palette is empty");
+  const labels = sourceLabels.slice();
+  const pixelWidthMm = ARTWORK_WIDTH_MM / width;
+  const pixelHeightMm = ARTWORK_HEIGHT_MM / height;
+  const pixelAreaMm2 = pixelWidthMm * pixelHeightMm;
+  const scale = printScale(width, height);
+  const labs = paints.map((paint) => rgbToLab(...hexToRgb(paint.hex)));
+  const componentMap = new Int32Array(labels.length);
+  componentMap.fill(-1);
+  const semanticMask = new Uint8Array(labels.length);
+  const semanticDescriptors = semanticRegions.map((region, ownerId) => {
+    const x0 = Math.max(0, Math.floor(region.x * width));
+    const y0 = Math.max(0, Math.floor(region.y * height));
+    const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
+    const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
+    for (let y = y0; y < y1; y++) semanticMask.fill(1, y * width + x0, y * width + x1);
+    return { ownerId, region, x0, y0, x1, y1 };
+  });
+  const totalSemanticPixels = semanticMask.reduce((sum, value) => sum + value, 0);
+  const nodes: RegionGraphNode[] = [];
+  const internalNodes: RegionGraphInternalNode[] = [];
+  const cooperativeYield: CooperativeYield = async () => undefined;
+
+  await walkComponents(labels, width, height, paints.length, (component) => {
+    const regionId = nodes.length;
+    for (const pixel of component.pixels) componentMap[pixel] = regionId;
+    let centroidX = 0;
+    let centroidY = 0;
+    let perimeterPx = 0;
+    let perimeterMm = 0;
+    let semanticPixelCount = 0;
+    const kindCounts = new Map<SemanticRegionKind, number>();
+    const semanticOwnerIds = new Set<number>();
+    for (const pixel of component.pixels) {
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      centroidX += x + 0.5;
+      centroidY += y + 0.5;
+      if (semanticMask[pixel]) semanticPixelCount++;
+      if (x === 0 || labels[pixel - 1] !== component.label) { perimeterPx++; perimeterMm += pixelHeightMm; }
+      if (x === width - 1 || labels[pixel + 1] !== component.label) { perimeterPx++; perimeterMm += pixelHeightMm; }
+      if (y === 0 || labels[pixel - width] !== component.label) { perimeterPx++; perimeterMm += pixelWidthMm; }
+      if (y === height - 1 || labels[pixel + width] !== component.label) { perimeterPx++; perimeterMm += pixelWidthMm; }
+    }
+    for (const descriptor of semanticDescriptors) {
+      if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
+      let overlap = 0;
+      for (const pixel of component.pixels) {
+        const x = pixel % width;
+        const y = Math.floor(pixel / width);
+        if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) overlap++;
+      }
+      if (!overlap) continue;
+      semanticOwnerIds.add(descriptor.ownerId);
+      kindCounts.set(descriptor.region.kind, (kindCounts.get(descriptor.region.kind) || 0) + overlap);
+    }
+    centroidX /= component.pixels.length;
+    centroidY /= component.pixels.length;
+    const distance = componentDistance(component, width);
+    const placement = findNumberPlacement(
+      component,
+      width,
+      component.label,
+      distance,
+      componentMask(component, width),
+      componentOrientation(component, width),
+      scale,
+    );
+    const areaMm2 = component.pixels.length * pixelAreaMm2;
+    const compactness = perimeterMm > 0 ? 4 * Math.PI * areaMm2 / (perimeterMm * perimeterMm) : 0;
+    const kinds = [...kindCounts.keys()].sort() as Array<SemanticRegionKind | "none">;
+    const paint = paints[component.label];
+    nodes.push({
+      regionId,
+      productionColorId: paint.id,
+      productionColorCode: paint.code,
+      pixelArea: component.pixels.length,
+      areaMm2,
+      bboxPx: { x: component.minX, y: component.minY, width: component.maxX - component.minX + 1, height: component.maxY - component.minY + 1 },
+      bboxMm: { x: component.minX * pixelWidthMm, y: component.minY * pixelHeightMm, width: (component.maxX - component.minX + 1) * pixelWidthMm, height: (component.maxY - component.minY + 1) * pixelHeightMm },
+      perimeterPx,
+      perimeterMm,
+      compactness,
+      minLocalWidthMm: distance.max * 2 * Math.min(pixelWidthMm, pixelHeightMm),
+      centroidPx: { x: centroidX, y: centroidY },
+      centroidMm: { x: centroidX * pixelWidthMm, y: centroidY * pixelHeightMm },
+      fits5Pt: Boolean(placement),
+      semanticOverlap: { kinds: kinds.length ? kinds : ["none"], ratio: semanticPixelCount / component.pixels.length },
+      neighboringRegionIds: [],
+      neighbors: [],
+    });
+    internalNodes.push({ component, semanticOwnerIds, semanticPixelCount });
+  }, cooperativeYield);
+
+  const rawEdges = new Map<string, { regionA: number; regionB: number; sharedBoundaryPx: number; sharedBoundaryMm: number }>();
+  const addBoundary = (left: number, right: number, lengthMm: number) => {
+    if (left === right) return;
+    const regionA = Math.min(left, right);
+    const regionB = Math.max(left, right);
+    const key = `${regionA}:${regionB}`;
+    const edge = rawEdges.get(key) || { regionA, regionB, sharedBoundaryPx: 0, sharedBoundaryMm: 0 };
+    edge.sharedBoundaryPx++;
+    edge.sharedBoundaryMm += lengthMm;
+    rawEdges.set(key, edge);
+  };
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const pixel = y * width + x;
+      if (x + 1 < width) addBoundary(componentMap[pixel], componentMap[pixel + 1], pixelHeightMm);
+      if (y + 1 < height) addBoundary(componentMap[pixel], componentMap[pixel + width], pixelWidthMm);
+    }
+  }
+
+  const criticalKinds = new Set<SemanticRegionKind>(["eye", "text", "logo"]);
+  const hasCritical = (node: RegionGraphNode) => node.semanticOverlap.kinds.some((kind) => kind !== "none" && criticalKinds.has(kind));
+  const setsOverlap = (left: Set<number>, right: Set<number>) => [...left].some((value) => right.has(value));
+  const mergedPlacementFits = (failedId: number, neighborId: number) => {
+    const failed = internalNodes[failedId].component;
+    const neighbor = internalNodes[neighborId].component;
+    const pixels = [...failed.pixels, ...neighbor.pixels];
+    const component: Component = {
+      label: neighbor.label,
+      pixels,
+      boundary: new Uint32Array(paints.length),
+      minX: Math.min(failed.minX, neighbor.minX),
+      maxX: Math.max(failed.maxX, neighbor.maxX),
+      minY: Math.min(failed.minY, neighbor.minY),
+      maxY: Math.max(failed.maxY, neighbor.maxY),
+    };
+    return Boolean(findNumberPlacement(component, width, component.label, componentDistance(component, width), componentMask(component, width), componentOrientation(component, width), scale));
+  };
+  const rejectedReasons = new Map<string, number>();
+  const edges: RegionGraphEdge[] = [];
+  for (const raw of [...rawEdges.values()].sort((left, right) => left.regionA - right.regionA || left.regionB - right.regionB)) {
+    const nodeA = nodes[raw.regionA];
+    const nodeB = nodes[raw.regionB];
+    const internalA = internalNodes[raw.regionA];
+    const internalB = internalNodes[raw.regionB];
+    const distance = Math.sqrt(labDistance(labs[internalA.component.label], labs[internalB.component.label]));
+    const sameSemanticOwner = setsOverlap(internalA.semanticOwnerIds, internalB.semanticOwnerIds);
+    const aSemantic = internalA.semanticOwnerIds.size > 0;
+    const bSemantic = internalB.semanticOwnerIds.size > 0;
+    const ownershipConflict = aSemantic && bSemantic && !sameSemanticOwner;
+    const semanticElimination = aSemantic !== bSemantic || ownershipConflict;
+    const hasFailedEndpoint = !nodeA.fits5Pt || !nodeB.fits5Pt;
+    const sharedRatio = raw.sharedBoundaryMm / Math.max(0.000001, Math.min(nodeA.perimeterMm, nodeB.perimeterMm));
+    const topologyRisk = raw.sharedBoundaryPx < 2 || sharedRatio < 0.01;
+    const colorCompatible = distance <= 18 || (sameSemanticOwner && distance <= 24);
+    let classification: RegionGraphMergeClassification;
+    let reason: string;
+    if (hasCritical(nodeA) || hasCritical(nodeB)) {
+      classification = "SEMANTIC-RISK"; reason = "critical-eye-text-logo";
+    } else if (semanticElimination) {
+      classification = "SEMANTIC-RISK"; reason = ownershipConflict ? "semantic-ownership-conflict" : "semantic-detail-elimination";
+    } else if (!hasFailedEndpoint) {
+      classification = "NOT-USEFUL"; reason = "no-failed-region";
+    } else if (topologyRisk) {
+      classification = "TOPOLOGY-RISK"; reason = "weak-boundary-contact";
+    } else if (!colorCompatible) {
+      classification = "COLOR-RISK"; reason = "lab-distance-too-large";
+    } else {
+      classification = "SAFE-CANDIDATE"; reason = "conservative-safe-candidate";
+    }
+    const resolvesFailedRegionIds: number[] = [];
+    if (classification === "SAFE-CANDIDATE") {
+      if (!nodeA.fits5Pt && mergedPlacementFits(raw.regionA, raw.regionB)) resolvesFailedRegionIds.push(raw.regionA);
+      if (!nodeB.fits5Pt && mergedPlacementFits(raw.regionB, raw.regionA)) resolvesFailedRegionIds.push(raw.regionB);
+    } else {
+      rejectedReasons.set(reason, (rejectedReasons.get(reason) || 0) + 1);
+    }
+    const mergeScore = classification === "SAFE-CANDIDATE"
+      ? Math.max(0, 100 - distance * 2 + Math.min(20, sharedRatio * 100) + resolvesFailedRegionIds.length * 10)
+      : 0;
+    const edge: RegionGraphEdge = { ...raw, labDistance: distance, mergeScore, classification, reason, resolvesFailedRegionIds };
+    edges.push(edge);
+    nodeA.neighbors.push({ regionId: raw.regionB, sharedBoundaryPx: raw.sharedBoundaryPx, sharedBoundaryMm: raw.sharedBoundaryMm, labDistance: distance });
+    nodeB.neighbors.push({ regionId: raw.regionA, sharedBoundaryPx: raw.sharedBoundaryPx, sharedBoundaryMm: raw.sharedBoundaryMm, labDistance: distance });
+  }
+  for (const node of nodes) {
+    node.neighbors.sort((left, right) => left.regionId - right.regionId);
+    node.neighboringRegionIds = node.neighbors.map((neighbor) => neighbor.regionId);
+  }
+
+  const safeEdges = edges.filter((edge) => edge.classification === "SAFE-CANDIDATE");
+  const failedWithSafe = new Set<number>();
+  const resolvable = new Set<number>();
+  for (const edge of safeEdges) {
+    if (!nodes[edge.regionA].fits5Pt) failedWithSafe.add(edge.regionA);
+    if (!nodes[edge.regionB].fits5Pt) failedWithSafe.add(edge.regionB);
+    for (const id of edge.resolvesFailedRegionIds) resolvable.add(id);
+  }
+  const selectedIds = new Set<number>();
+  const selectedEdges: RegionGraphEdge[] = [];
+  for (const edge of [...safeEdges].sort((left, right) => right.mergeScore - left.mergeScore || left.regionA - right.regionA || left.regionB - right.regionB)) {
+    if (!edge.resolvesFailedRegionIds.length || selectedIds.has(edge.regionA) || selectedIds.has(edge.regionB)) continue;
+    selectedIds.add(edge.regionA);
+    selectedIds.add(edge.regionB);
+    selectedEdges.push(edge);
+  }
+  const affectedPixels = [...selectedIds].reduce((sum, id) => sum + nodes[id].pixelArea, 0);
+  const affectedSemanticPixels = [...selectedIds].reduce((sum, id) => sum + internalNodes[id].semanticPixelCount, 0);
+  const failedNodes = nodes.filter((node) => !node.fits5Pt);
+  const semanticFailedNodes = failedNodes.filter((node) => node.semanticOverlap.kinds[0] !== "none");
+  const safeLabDistances = safeEdges.map((edge) => edge.labDistance);
+  const topRejectedReasons = [...rejectedReasons.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason))
+    .slice(0, 8);
+  return {
+    width,
+    height,
+    nodes,
+    edges,
+    summary: {
+      totalNodes: nodes.length,
+      totalEdges: edges.length,
+      failedNodes: failedNodes.length,
+      semanticFailedNodes: semanticFailedNodes.length,
+      nonSemanticFailedNodes: failedNodes.length - semanticFailedNodes.length,
+      safeCandidateEdges: safeEdges.length,
+      failedNodesWithSafeCandidate: failedWithSafe.size,
+      failedNodesResolvableByOneSafeMerge: resolvable.size,
+      semanticFailedNodesResolvableWithoutCriticalDetail: [...resolvable].filter((id) => nodes[id].semanticOverlap.kinds[0] !== "none" && !hasCritical(nodes[id])).length,
+      estimatedOnePassRegionReduction: selectedEdges.length,
+      estimatedOnePassRegionReductionPercent: nodes.length ? selectedEdges.length / nodes.length * 100 : 0,
+      affectedAreaPercent: labels.length ? affectedPixels / labels.length * 100 : 0,
+      semanticAreaPercentAffected: totalSemanticPixels ? affectedSemanticPixels / totalSemanticPixels * 100 : 0,
+      safeCandidateLabDistances: physicalMetricSummary(safeLabDistances),
+      topRejectedReasons,
+    },
+  };
+}
+
+export async function buildRegionGraphDiagnostic(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+): Promise<RegionGraphDiagnosticResult> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const resizeScale = Math.min(1, 3000 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * resizeScale));
+  const height = Math.max(1, Math.round(image.height * resizeScale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, width, height);
+  const rgba = context.getImageData(0, 0, width, height).data;
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    if (rgba[pixel * 4 + 3] !== 255) throw new Error("Region-graph raster must be fully opaque");
+    rgb[pixel * 3] = rgba[pixel * 4];
+    rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1];
+    rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2];
+  }
+  const approved = approvedPaletteAssignment(rgb, palette);
+  const labels = new Uint8Array(width * height);
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    const key = (rgb[pixel * 3] << 16) | (rgb[pixel * 3 + 1] << 8) | rgb[pixel * 3 + 2];
+    labels[pixel] = approved.assignment.get(key) ?? 0;
+  }
+  return buildRegionGraphDiagnosticFromLabelMap(labels, width, height, approved.selectedPaints, semanticRegions);
 }
 
 export async function createProductionFailureOverlay(

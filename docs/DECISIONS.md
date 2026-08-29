@@ -53,5 +53,8 @@ In `global-rebuild`, the selected production palette remains an allowed pool whi
 ## D-017 — Global rebuild uses a deterministic reduced palette before final snap
 Only `global-rebuild` derives an image-driven 28-color subset (bounded to 24–32 and to the available pool) from the AI-corrected image before final palette snapping. The subset contains only paints from the selected production palette, preserves representative dark, light and saturated structural colors, and is then used consistently by palette snap, semantic analysis, Phase B, Phase C and readiness. The allowed-pool size and the actually used color count remain separate diagnostics; the master palette is not mutated. Standard generation and `local-repair` retain their existing palette behavior.
 
+## D-018 — Phase R1 region graph is diagnostic only
+The deterministic region graph is built from the accepted post-B+C 4-connected palette raster and may classify adjacent pairs or estimate possible safe merges, but it never mutates pixels, recolors regions, contracts the graph or feeds decisions back into readiness, numbering, contours, SVG/PDF or the approved Final Region Map. Production output remains unchanged until a later phase is separately approved.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
