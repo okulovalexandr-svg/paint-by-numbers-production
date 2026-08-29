@@ -59,5 +59,8 @@ The deterministic region graph is built from the accepted post-B+C 4-connected p
 ## D-019 — Phase R2 optimization remains a reversible dry-run
 The iterative optimizer may recolor and contract regions only on a private clone of the post-B+C raster, rebuilding the R1 graph and exact 5 pt fit state after each accepted batch. It must roll back any objective or safety regression and cannot feed its simulated raster into production output, UI approval or the immutable Final Region Map. Eyes, text and logos remain hard-protected; conservative rectangular semantic ownership is diagnostic evidence, not authorization for a production optimizer.
 
+## D-020 — Phase S1 semantic masks follow existing region boundaries
+Semantic rectangles may be converted diagnostically into deterministic ownership masks only by selecting complete existing post-B+C 4-connected paint regions. Critical eye/text/logo cores remain fully protected, crossing background regions require materially stronger ownership evidence, and ambiguous same-priority ownership is preserved rather than guessed. S1 masks are optional simulator inputs only and do not change the semantic-analysis API, production raster, validator, Phase B/C, numbering, contours, SVG/PDF or immutable Final Region Map.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

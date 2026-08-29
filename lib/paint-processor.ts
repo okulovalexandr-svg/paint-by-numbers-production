@@ -217,6 +217,58 @@ export type RegionOptimizerTrajectoryPoint = RegionOptimizerReadinessSnapshot & 
 export type RegionOptimizerSimulationOptions = {
   maxAcceptedOperations?: number;
   maxPasses?: number;
+  semanticOwnership?: RegionAlignedSemanticOwnershipResult;
+};
+
+export type RegionAlignedSemanticEvidence = {
+  ownerId: number;
+  kind: SemanticRegionKind;
+  bboxIntersectionPixels: number;
+  overlapRatioOfRegion: number;
+  overlapRatioOfBbox: number;
+  centroidInside: boolean;
+  adjacentToOwnedRegion: boolean;
+  criticalCoreIntersectionPixels: number;
+};
+
+export type RegionAlignedSemanticRegionOwnership = {
+  regionId: number;
+  pixelArea: number;
+  ownerIds: number[];
+  kinds: SemanticRegionKind[];
+  ambiguous: boolean;
+  critical: boolean;
+  evidence: RegionAlignedSemanticEvidence[];
+};
+
+export type RegionAlignedSemanticOwnerMask = {
+  ownerId: number;
+  kind: SemanticRegionKind;
+  priority: "critical" | "protected";
+  mask: Uint8Array;
+};
+
+export type RegionAlignedSemanticOwnershipResult = {
+  width: number;
+  height: number;
+  semanticMask: Uint8Array;
+  criticalMask: Uint8Array;
+  ownerMasks: RegionAlignedSemanticOwnerMask[];
+  regions: RegionAlignedSemanticRegionOwnership[];
+  protectedPixels: number;
+  protectedRegionCount: number;
+  criticalProtectedPixels: number;
+  criticalProtectedRegionCount: number;
+  ambiguousOwnershipCount: number;
+  bboxProtectedPixels: number;
+  bboxProtectedRegionCount: number;
+  bboxCriticalProtectedPixels: number;
+  bboxCriticalProtectedRegionCount: number;
+  bboxProtectedPixelsReleased: number;
+  regionsNewlyProtectedByCriticalCore: number;
+  semanticAreaReductionPercent: number;
+  criticalCoreCoverage: number;
+  maskCheckpoint: string;
 };
 
 export type RegionOptimizerSimulationResult = {
@@ -2478,6 +2530,261 @@ type RegionGraphInternalNode = {
   semanticPixelCount: number;
 };
 
+type SemanticPixelDescriptor = {
+  ownerId: number;
+  region: SemanticRegion;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  coreX0: number;
+  coreY0: number;
+  coreX1: number;
+  coreY1: number;
+  bboxArea: number;
+  critical: boolean;
+};
+
+function semanticPixelDescriptors(width: number, height: number, regions: SemanticRegion[]): SemanticPixelDescriptor[] {
+  return regions.map((region, ownerId) => {
+    const x0 = Math.max(0, Math.floor(region.x * width));
+    const y0 = Math.max(0, Math.floor(region.y * height));
+    const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
+    const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
+    const insetX = Math.floor((x1 - x0) * 0.25);
+    const insetY = Math.floor((y1 - y0) * 0.25);
+    const coreX0 = Math.min(x1, x0 + insetX);
+    const coreY0 = Math.min(y1, y0 + insetY);
+    const coreX1 = Math.max(coreX0 + Number(x1 > x0), x1 - insetX);
+    const coreY1 = Math.max(coreY0 + Number(y1 > y0), y1 - insetY);
+    return {
+      ownerId,
+      region,
+      x0,
+      y0,
+      x1,
+      y1,
+      coreX0,
+      coreY0,
+      coreX1: Math.min(x1, coreX1),
+      coreY1: Math.min(y1, coreY1),
+      bboxArea: Math.max(0, x1 - x0) * Math.max(0, y1 - y0),
+      critical: region.priority === "critical" || region.kind === "eye" || region.kind === "text" || region.kind === "logo",
+    };
+  });
+}
+
+function semanticMaskCheckpoint(result: Pick<RegionAlignedSemanticOwnershipResult, "semanticMask" | "criticalMask" | "regions">) {
+  let hash = 0x811c9dc5;
+  const update = (value: number) => {
+    hash ^= value & 255;
+    hash = Math.imul(hash, 0x01000193);
+  };
+  for (const value of result.semanticMask) update(value);
+  for (const value of result.criticalMask) update(value);
+  for (const region of result.regions) {
+    update(region.regionId); update(region.regionId >>> 8); update(region.ambiguous ? 1 : 0); update(region.critical ? 1 : 0);
+    for (const ownerId of region.ownerIds) { update(ownerId); update(ownerId >>> 8); }
+  }
+  return `SM-${(hash >>> 0).toString(16).padStart(8, "0").toUpperCase()}`;
+}
+
+/**
+ * Phase S1 diagnostic only. Converts coarse semantic rectangles into masks
+ * made exclusively from complete existing 4-connected paint regions.
+ */
+export async function buildRegionAlignedSemanticOwnershipFromLabelMap(
+  sourceLabels: Uint8Array,
+  width: number,
+  height: number,
+  semanticRegions: SemanticRegion[] = [],
+): Promise<RegionAlignedSemanticOwnershipResult> {
+  if (width < 1 || height < 1 || sourceLabels.length !== width * height) throw new Error("Invalid semantic-mask label map dimensions");
+  const labels = sourceLabels.slice();
+  const maxLabel = labels.reduce((maximum, label) => Math.max(maximum, label), 0);
+  const components: Component[] = [];
+  const componentMap = new Int32Array(labels.length);
+  componentMap.fill(-1);
+  await walkComponents(labels, width, height, maxLabel + 1, (component) => {
+    const regionId = components.length;
+    components.push(component);
+    for (const pixel of component.pixels) componentMap[pixel] = regionId;
+  }, async () => undefined);
+
+  const adjacency = components.map(() => new Set<number>());
+  const connect = (left: number, right: number) => {
+    if (left === right) return;
+    adjacency[left].add(right);
+    adjacency[right].add(left);
+  };
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x;
+    if (x + 1 < width) connect(componentMap[pixel], componentMap[pixel + 1]);
+    if (y + 1 < height) connect(componentMap[pixel], componentMap[pixel + width]);
+  }
+
+  const descriptors = semanticPixelDescriptors(width, height, semanticRegions);
+  const evidence = components.map((component) => descriptors.map((descriptor): RegionAlignedSemanticEvidence => {
+    let bboxIntersectionPixels = 0;
+    let criticalCoreIntersectionPixels = 0;
+    let centroidX = 0;
+    let centroidY = 0;
+    for (const pixel of component.pixels) {
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      centroidX += x + 0.5;
+      centroidY += y + 0.5;
+      if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) bboxIntersectionPixels++;
+      if (x >= descriptor.coreX0 && x < descriptor.coreX1 && y >= descriptor.coreY0 && y < descriptor.coreY1) criticalCoreIntersectionPixels++;
+    }
+    centroidX /= component.pixels.length;
+    centroidY /= component.pixels.length;
+    return {
+      ownerId: descriptor.ownerId,
+      kind: descriptor.region.kind,
+      bboxIntersectionPixels,
+      overlapRatioOfRegion: bboxIntersectionPixels / component.pixels.length,
+      overlapRatioOfBbox: descriptor.bboxArea ? bboxIntersectionPixels / descriptor.bboxArea : 0,
+      centroidInside: centroidX >= descriptor.x0 && centroidX < descriptor.x1 && centroidY >= descriptor.y0 && centroidY < descriptor.y1,
+      adjacentToOwnedRegion: false,
+      criticalCoreIntersectionPixels,
+    };
+  }));
+
+  const candidateOwners = components.map(() => new Set<number>());
+  const criticalCoreOnly = new Set<number>();
+  for (let regionId = 0; regionId < components.length; regionId++) {
+    for (const item of evidence[regionId]) {
+      const descriptor = descriptors[item.ownerId];
+      if (descriptor.critical) {
+        const strongOverlap = item.overlapRatioOfRegion >= 0.35;
+        const centroidInCore = (() => {
+          const centroid = components[regionId].pixels.reduce((sum, pixel) => {
+            sum.x += pixel % width + 0.5; sum.y += Math.floor(pixel / width) + 0.5; return sum;
+          }, { x: 0, y: 0 });
+          centroid.x /= components[regionId].pixels.length; centroid.y /= components[regionId].pixels.length;
+          return centroid.x >= descriptor.coreX0 && centroid.x < descriptor.coreX1 && centroid.y >= descriptor.coreY0 && centroid.y < descriptor.coreY1;
+        })();
+        if (strongOverlap || centroidInCore || item.criticalCoreIntersectionPixels > 0) {
+          candidateOwners[regionId].add(item.ownerId);
+          if (!strongOverlap && !centroidInCore && item.criticalCoreIntersectionPixels > 0) criticalCoreOnly.add(regionId);
+        }
+      } else if (item.overlapRatioOfRegion >= 0.60 || (item.centroidInside && item.overlapRatioOfRegion >= 0.30)) {
+        candidateOwners[regionId].add(item.ownerId);
+      }
+    }
+  }
+
+  // Protected ownership may grow only from an existing seed through direct
+  // region adjacency, and every grown region must remain materially in-box.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const descriptor of descriptors) {
+      if (descriptor.critical) continue;
+      const owned = new Set<number>();
+      for (let regionId = 0; regionId < candidateOwners.length; regionId++) if (candidateOwners[regionId].has(descriptor.ownerId)) owned.add(regionId);
+      for (let regionId = 0; regionId < components.length; regionId++) {
+        if (owned.has(regionId)) continue;
+        const item = evidence[regionId][descriptor.ownerId];
+        if (!item.centroidInside || item.overlapRatioOfRegion < 0.20) continue;
+        if (components[regionId].pixels.length > descriptor.bboxArea * 0.50) continue;
+        if (![...adjacency[regionId]].some((neighbor) => owned.has(neighbor))) continue;
+        item.adjacentToOwnedRegion = true;
+        candidateOwners[regionId].add(descriptor.ownerId);
+        grew = true;
+      }
+    }
+  }
+
+  const semanticMask = new Uint8Array(labels.length);
+  const criticalMask = new Uint8Array(labels.length);
+  const ownerMasks: RegionAlignedSemanticOwnerMask[] = descriptors.map((descriptor) => ({
+    ownerId: descriptor.ownerId,
+    kind: descriptor.region.kind,
+    priority: descriptor.critical ? "critical" : "protected",
+    mask: new Uint8Array(labels.length),
+  }));
+  const regions: RegionAlignedSemanticRegionOwnership[] = [];
+  let protectedRegionCount = 0;
+  let criticalProtectedRegionCount = 0;
+  let ambiguousOwnershipCount = 0;
+  for (let regionId = 0; regionId < components.length; regionId++) {
+    const candidates = [...candidateOwners[regionId]].sort((left, right) => left - right);
+    const criticalOwners = candidates.filter((ownerId) => descriptors[ownerId].critical);
+    const ownerIds = (criticalOwners.length ? criticalOwners : candidates).sort((left, right) => left - right);
+    const kinds = [...new Set(ownerIds.map((ownerId) => descriptors[ownerId].region.kind))].sort();
+    const ambiguous = ownerIds.length > 1;
+    const critical = criticalOwners.length > 0;
+    if (ownerIds.length) {
+      protectedRegionCount++;
+      if (critical) criticalProtectedRegionCount++;
+      if (ambiguous) ambiguousOwnershipCount++;
+      for (const pixel of components[regionId].pixels) {
+        semanticMask[pixel] = 1;
+        if (critical) criticalMask[pixel] = 1;
+        for (const ownerId of ownerIds) ownerMasks[ownerId].mask[pixel] = 1;
+      }
+    }
+    regions.push({
+      regionId,
+      pixelArea: components[regionId].pixels.length,
+      ownerIds,
+      kinds,
+      ambiguous,
+      critical,
+      evidence: evidence[regionId].filter((item) => item.bboxIntersectionPixels > 0 || ownerIds.includes(item.ownerId)),
+    });
+  }
+
+  const bboxMask = new Uint8Array(labels.length);
+  const bboxCriticalMask = new Uint8Array(labels.length);
+  const bboxRegions = new Set<number>();
+  const bboxCriticalRegions = new Set<number>();
+  let criticalCorePixels = 0;
+  let protectedCriticalCorePixels = 0;
+  for (const descriptor of descriptors) {
+    for (let y = descriptor.y0; y < descriptor.y1; y++) for (let x = descriptor.x0; x < descriptor.x1; x++) {
+      const pixel = y * width + x;
+      bboxMask[pixel] = 1;
+      bboxRegions.add(componentMap[pixel]);
+      if (descriptor.critical) { bboxCriticalMask[pixel] = 1; bboxCriticalRegions.add(componentMap[pixel]); }
+    }
+    if (descriptor.critical) for (let y = descriptor.coreY0; y < descriptor.coreY1; y++) for (let x = descriptor.coreX0; x < descriptor.coreX1; x++) {
+      const pixel = y * width + x;
+      criticalCorePixels++;
+      if (criticalMask[pixel]) protectedCriticalCorePixels++;
+    }
+  }
+  const countMask = (mask: Uint8Array) => mask.reduce((sum, value) => sum + value, 0);
+  const protectedPixels = countMask(semanticMask);
+  const bboxProtectedPixels = countMask(bboxMask);
+  let bboxProtectedPixelsReleased = 0;
+  for (let pixel = 0; pixel < labels.length; pixel++) if (bboxMask[pixel] && !semanticMask[pixel]) bboxProtectedPixelsReleased++;
+  const partial: Omit<RegionAlignedSemanticOwnershipResult, "maskCheckpoint"> = {
+    width,
+    height,
+    semanticMask,
+    criticalMask,
+    ownerMasks,
+    regions,
+    protectedPixels,
+    protectedRegionCount,
+    criticalProtectedPixels: countMask(criticalMask),
+    criticalProtectedRegionCount,
+    ambiguousOwnershipCount,
+    bboxProtectedPixels,
+    bboxProtectedRegionCount: bboxRegions.size,
+    bboxCriticalProtectedPixels: countMask(bboxCriticalMask),
+    bboxCriticalProtectedRegionCount: bboxCriticalRegions.size,
+    bboxProtectedPixelsReleased,
+    regionsNewlyProtectedByCriticalCore: criticalCoreOnly.size,
+    semanticAreaReductionPercent: bboxProtectedPixels ? (bboxProtectedPixels - protectedPixels) / bboxProtectedPixels * 100 : 0,
+    criticalCoreCoverage: criticalCorePixels ? protectedCriticalCorePixels / criticalCorePixels * 100 : 100,
+  };
+  return { ...partial, maskCheckpoint: semanticMaskCheckpoint(partial) };
+}
+
 /**
  * Builds a read-only graph from an existing 4-connected production label map.
  * This diagnostic never mutates labels and is deliberately not called by the
@@ -2489,6 +2796,7 @@ export async function buildRegionGraphDiagnosticFromLabelMap(
   height: number,
   paints: ProductionPaint[],
   semanticRegions: SemanticRegion[] = [],
+  semanticOwnership?: RegionAlignedSemanticOwnershipResult,
 ): Promise<RegionGraphDiagnosticResult> {
   if (width < 1 || height < 1 || sourceLabels.length !== width * height) throw new Error("Invalid region-graph label map dimensions");
   if (!paints.length) throw new Error("Production palette is empty");
@@ -2500,14 +2808,17 @@ export async function buildRegionGraphDiagnosticFromLabelMap(
   const labs = paints.map((paint) => rgbToLab(...hexToRgb(paint.hex)));
   const componentMap = new Int32Array(labels.length);
   componentMap.fill(-1);
-  const semanticMask = new Uint8Array(labels.length);
+  if (semanticOwnership && (semanticOwnership.width !== width || semanticOwnership.height !== height || semanticOwnership.semanticMask.length !== labels.length)) {
+    throw new Error("Semantic ownership dimensions do not match region graph");
+  }
+  const semanticMask = semanticOwnership ? semanticOwnership.semanticMask.slice() : new Uint8Array(labels.length);
   const semanticDescriptors = semanticRegions.map((region, ownerId) => {
     const x0 = Math.max(0, Math.floor(region.x * width));
     const y0 = Math.max(0, Math.floor(region.y * height));
     const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
     const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
-    for (let y = y0; y < y1; y++) semanticMask.fill(1, y * width + x0, y * width + x1);
-    return { ownerId, region, x0, y0, x1, y1 };
+    if (!semanticOwnership) for (let y = y0; y < y1; y++) semanticMask.fill(1, y * width + x0, y * width + x1);
+    return { ownerId, region, x0, y0, x1, y1, mask: semanticOwnership?.ownerMasks[ownerId]?.mask };
   });
   const totalSemanticPixels = semanticMask.reduce((sum, value) => sum + value, 0);
   const nodes: RegionGraphNode[] = [];
@@ -2536,12 +2847,16 @@ export async function buildRegionGraphDiagnosticFromLabelMap(
       if (y === height - 1 || labels[pixel + width] !== component.label) { perimeterPx++; perimeterMm += pixelWidthMm; }
     }
     for (const descriptor of semanticDescriptors) {
-      if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
       let overlap = 0;
-      for (const pixel of component.pixels) {
-        const x = pixel % width;
-        const y = Math.floor(pixel / width);
-        if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) overlap++;
+      if (descriptor.mask) {
+        for (const pixel of component.pixels) if (descriptor.mask[pixel]) overlap++;
+      } else {
+        if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
+        for (const pixel of component.pixels) {
+          const x = pixel % width;
+          const y = Math.floor(pixel / width);
+          if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) overlap++;
+        }
       }
       if (!overlap) continue;
       semanticOwnerIds.add(descriptor.ownerId);
@@ -2845,25 +3160,29 @@ export async function simulateIterativeRegionOptimizerFromLabelMap(
   if (!paints.length) throw new Error("Production palette is empty");
   const originalLabels = sourceLabels.slice();
   let labels = sourceLabels.slice();
-  const initialGraph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints, semanticRegions);
+  const semanticOwnership = options.semanticOwnership;
+  if (semanticOwnership && (semanticOwnership.width !== width || semanticOwnership.height !== height || semanticOwnership.semanticMask.length !== labels.length)) {
+    throw new Error("Semantic ownership dimensions do not match optimizer raster");
+  }
+  const initialGraph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints, semanticRegions, semanticOwnership);
   let graph = initialGraph;
   const start = regionOptimizerSnapshot(initialGraph);
   const maxPasses = Math.max(1, Math.min(20, options.maxPasses ?? 20));
   const maxAcceptedOperations = Math.max(1, Math.min(5000, start.regions, options.maxAcceptedOperations ?? Math.min(5000, start.regions)));
   const batchLimit = Math.max(1, Math.ceil(maxAcceptedOperations / maxPasses));
-  const semanticMask = new Uint8Array(labels.length);
-  const criticalMask = new Uint8Array(labels.length);
+  const semanticMask = semanticOwnership ? semanticOwnership.semanticMask.slice() : new Uint8Array(labels.length);
+  const criticalMask = semanticOwnership ? semanticOwnership.criticalMask.slice() : new Uint8Array(labels.length);
   const descriptors = semanticRegions.map((region, ownerId) => {
     const x0 = Math.max(0, Math.floor(region.x * width));
     const y0 = Math.max(0, Math.floor(region.y * height));
     const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
     const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
     const critical = region.kind === "eye" || region.kind === "text" || region.kind === "logo";
-    for (let y = y0; y < y1; y++) {
+    if (!semanticOwnership) for (let y = y0; y < y1; y++) {
       semanticMask.fill(1, y * width + x0, y * width + x1);
       if (critical) criticalMask.fill(1, y * width + x0, y * width + x1);
     }
-    return { ownerId, region, x0, y0, x1, y1, critical };
+    return { ownerId, region, x0, y0, x1, y1, critical, mask: semanticOwnership?.ownerMasks[ownerId]?.mask };
   });
   const totalSemanticPixels = semanticMask.reduce((sum, value) => sum + value, 0);
   const initialColorCounts = new Uint32Array(paints.length);
@@ -2899,12 +3218,16 @@ export async function simulateIterativeRegionOptimizerFromLabelMap(
       if (criticalMask[pixel]) criticalPixelCount++;
     }
     for (const descriptor of descriptors) {
-      if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
       let overlap = false;
-      for (const pixel of component.pixels) {
-        const x = pixel % width;
-        const y = Math.floor(pixel / width);
-        if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) { overlap = true; break; }
+      if (descriptor.mask) {
+        for (const pixel of component.pixels) if (descriptor.mask[pixel]) { overlap = true; break; }
+      } else {
+        if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
+        for (const pixel of component.pixels) {
+          const x = pixel % width;
+          const y = Math.floor(pixel / width);
+          if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) { overlap = true; break; }
+        }
       }
       if (overlap) { ownerIds.add(descriptor.ownerId); kinds.add(descriptor.region.kind); }
     }
@@ -2983,7 +3306,7 @@ export async function simulateIterativeRegionOptimizerFromLabelMap(
       const targetLabel = components[operation.targetId].label;
       for (const pixel of components[operation.donorId].pixels) trialLabels[pixel] = targetLabel;
     }
-    const trialGraph = await buildRegionGraphDiagnosticFromLabelMap(trialLabels, width, height, paints, semanticRegions);
+    const trialGraph = await buildRegionGraphDiagnosticFromLabelMap(trialLabels, width, height, paints, semanticRegions, semanticOwnership);
     const trialSnapshot = regionOptimizerSnapshot(trialGraph);
     const currentSnapshot = regionOptimizerSnapshot(graph);
     const { componentMap: trialComponentMap } = await collectComponents(trialLabels);
