@@ -47,5 +47,8 @@ Production correction remains one explicit user-triggered AI edit before approva
 ## D-015 — A selected production palette is an allowed set
 Production-correction output may use only colors from the selected production palette, but it does not have to use every listed color. A rarely used color must never be forced into tiny regions merely to keep that color visible.
 
+## D-016 — Phase A3 compresses active colors only during correction
+In `global-rebuild`, the selected production palette remains an allowed pool while the corrected portrait/people/wedding preview targets 24–32 actually used colors and aggressively consolidates near-identical tones in skin, white clothing, background, hair and bouquet. `local-repair` also avoids near-duplicate tones but has no hard active-color budget. The actual post-correction active-color count is diagnostic state only; it does not change validator thresholds or the immutable Final Region Map contract.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

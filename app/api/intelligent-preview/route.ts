@@ -158,6 +158,13 @@ function buildPrompt(
   const paletteList = palette.map((paint, index) => `${index + 1}. ${paint.code} · ${paint.name} · ${paint.hex}`).join("\n");
 
   if (mode === "production-correction" && correctionStrategy && readiness) {
+    const activeColorRule = correctionStrategy === "global-rebuild"
+      ? profile === "portrait"
+        ? "Use 24–32 actually active colors across the finished portrait/people/wedding image."
+        : profile === "auto"
+          ? "If the source is a portrait, people or wedding scene, use 24–32 actually active colors; otherwise use a clearly smaller coherent subset of the allowed pool."
+          : "Use a clearly smaller coherent active-color subset of the allowed pool; do not keep colors active merely because they are available."
+      : "Avoid near-duplicate active tones, but do not apply a fixed active-color budget in local-repair mode.";
     const inputLabels = correctionStrategy === "global-rebuild"
       ? hasReference
         ? `- Image 1 is the original source and is the primary identity, composition, pose and crop reference.
@@ -173,11 +180,16 @@ ${hasReference ? "- Image 3 is the original source reference. Use it only to pre
 - The current map is globally over-fragmented. Reconstruct the whole image into substantially larger coherent flat paint regions, especially across faces, eyes, hands, hair/fur and clothing.
 - Prefer the original source for identity and composition when it is provided. The failed preview is not microgeometry that must be preserved.
 - Preserve identity, pose, crop, silhouette, proportions and recognizable important details, while simplifying tonal modelling into broad contiguous shapes instead of texture or micro-shading.
-- Substantially reduce connected-region density and microfragmentation across the full image. Do not invent a new numeric pass threshold.`
+- Substantially reduce connected-region density and microfragmentation across the full image. Do not invent a new numeric pass threshold.
+- ACTIVE-COLOR COMPRESSION: ${activeColorRule}
+- Treat the selected production palette only as an allowed color pool. Aggressively consolidate near-identical shades in skin, white clothing, background, hair and bouquet into fewer reusable active colors.
+- Remove rare redundant shades by mapping those areas to the nearest already-active coherent tone. Never create a microregion to keep a rare shade active.`
       : `LOCAL REPAIR STRATEGY
 - Keep Image 1 as the primary edit target and preserve its already-good coherent regions.
 - Rework highlighted FAIL zones only as much as needed to create larger coherent paintable shapes.
-- Preserve composition, crop, identity, pose, proportions and all already-good major forms.`;
+- Preserve composition, crop, identity, pose, proportions and all already-good major forms.
+- ${activeColorRule}
+- Consolidate near-duplicate shades where that does not disturb already-good geometry; never add a small region merely to retain a rare shade.`;
     return `
 You are correcting an existing palette-ready paint-by-numbers preview for production.
 
@@ -206,10 +218,10 @@ REQUIRED CORRECTION
 - Total connected-region count must not increase as a way of adding detail. Never replace one failed semantic region with multiple smaller tonal fragments.
 - No dots, crumbs, narrow rings, one-pixel or very-thin bands, checker-like palette alternation, dithering, gradients, noise, antialiasing or micro-islands.
 - Every visible 4-connected paint region must physically fit one internal production number at 5 pt or larger.
-- Use only exact solid colors from the selected production palette below. It is NOT necessary to use every listed color. Never create tiny regions merely to preserve a rarely used palette color.
+- Use only exact solid colors from the allowed production-palette pool below. The active colors in the result must be a subset of this pool. It is NOT necessary to use every listed color. Never create tiny regions merely to preserve a rarely used palette color.
 - Do not add numbers, contours, leader lines, annotations, overlay colors or diagnostic marks.
 
-SELECTED PRODUCTION PALETTE (${targetColors} colors)
+ALLOWED PRODUCTION-PALETTE POOL (${targetColors} colors; active subset may be smaller)
 ${paletteList}
 
 Return only the corrected full-frame color preview.`.trim();
