@@ -56,5 +56,8 @@ Only `global-rebuild` derives an image-driven 28-color subset (bounded to 24–3
 ## D-018 — Phase R1 region graph is diagnostic only
 The deterministic region graph is built from the accepted post-B+C 4-connected palette raster and may classify adjacent pairs or estimate possible safe merges, but it never mutates pixels, recolors regions, contracts the graph or feeds decisions back into readiness, numbering, contours, SVG/PDF or the approved Final Region Map. Production output remains unchanged until a later phase is separately approved.
 
+## D-019 — Phase R2 optimization remains a reversible dry-run
+The iterative optimizer may recolor and contract regions only on a private clone of the post-B+C raster, rebuilding the R1 graph and exact 5 pt fit state after each accepted batch. It must roll back any objective or safety regression and cannot feed its simulated raster into production output, UI approval or the immutable Final Region Map. Eyes, text and logos remain hard-protected; conservative rectangular semantic ownership is diagnostic evidence, not authorization for a production optimizer.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

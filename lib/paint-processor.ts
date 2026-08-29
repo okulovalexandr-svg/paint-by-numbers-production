@@ -201,6 +201,55 @@ export type RegionGraphDiagnosticResult = {
   summary: RegionGraphDiagnosticSummary;
 };
 
+export type RegionOptimizerReadinessSnapshot = {
+  regions: number;
+  failCount: number;
+  fitCoverage: number;
+  failedAreaPercent: number;
+};
+
+export type RegionOptimizerTrajectoryPoint = RegionOptimizerReadinessSnapshot & {
+  pass: number;
+  acceptedOperations: number;
+  acceptedOperationsPercent: number;
+};
+
+export type RegionOptimizerSimulationOptions = {
+  maxAcceptedOperations?: number;
+  maxPasses?: number;
+};
+
+export type RegionOptimizerSimulationResult = {
+  width: number;
+  height: number;
+  start: RegionOptimizerReadinessSnapshot;
+  end: RegionOptimizerReadinessSnapshot;
+  acceptedOperations: number;
+  acceptedSemanticOperations: number;
+  acceptedNonSemanticOperations: number;
+  rejectedOperationsByReason: Record<string, number>;
+  regionReductionPercent: number;
+  failReductionPercent: number;
+  semanticAreaChangedPercent: number;
+  rasterAreaChangedPercent: number;
+  colorsBefore: number;
+  colorsAfter: number;
+  eliminatedColorCodes: string[];
+  criticalPixelsChanged: number;
+  newFailuresCreated: number;
+  passes: number;
+  maxPasses: number;
+  maxAcceptedOperations: number;
+  capHit: boolean;
+  stopReason: "no-improving-safe-operation" | "max-passes" | "max-accepted-operations";
+  finalRasterCheckpoint: string;
+  finalGraphCheckpoint: string;
+  trajectory: RegionOptimizerTrajectoryPoint[];
+  trajectoryCheckpoints: Record<"1%" | "5%" | "10%" | "25%", RegionOptimizerTrajectoryPoint>;
+  finalGraph: RegionGraphDiagnosticResult;
+  simulatedLabels: Uint8Array;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -2709,6 +2758,349 @@ export async function buildRegionGraphDiagnostic(
     labels[pixel] = approved.assignment.get(key) ?? 0;
   }
   return buildRegionGraphDiagnosticFromLabelMap(labels, width, height, approved.selectedPaints, semanticRegions);
+}
+
+type RegionOptimizerSemanticIdentity = {
+  ownerIds: Set<number>;
+  kinds: Set<SemanticRegionKind>;
+  semanticPixelCount: number;
+  criticalPixelCount: number;
+};
+
+function regionGraphCheckpoint(graph: RegionGraphDiagnosticResult) {
+  let hash = 0x811c9dc5;
+  const update = (value: number) => {
+    hash ^= value & 255;
+    hash = Math.imul(hash, 0x01000193);
+  };
+  const updateNumber = (value: number) => {
+    const normalized = Math.round(value * 1_000_000);
+    update(normalized); update(normalized >>> 8); update(normalized >>> 16); update(normalized >>> 24);
+  };
+  for (const node of graph.nodes) {
+    updateNumber(node.regionId); updateNumber(node.productionColorId); updateNumber(node.pixelArea);
+    updateNumber(node.perimeterPx); updateNumber(node.compactness); updateNumber(node.minLocalWidthMm); update(node.fits5Pt ? 1 : 0);
+    for (const kind of node.semanticOverlap.kinds) for (const character of kind) update(character.charCodeAt(0));
+    updateNumber(node.semanticOverlap.ratio);
+  }
+  for (const edge of graph.edges) {
+    updateNumber(edge.regionA); updateNumber(edge.regionB); updateNumber(edge.sharedBoundaryPx); updateNumber(edge.labDistance);
+    for (const character of edge.classification) update(character.charCodeAt(0));
+  }
+  return `RG-${(hash >>> 0).toString(16).padStart(8, "0").toUpperCase()}`;
+}
+
+function regionOptimizerSnapshot(graph: RegionGraphDiagnosticResult): RegionOptimizerReadinessSnapshot {
+  const failedPixels = graph.nodes.reduce((sum, node) => sum + (node.fits5Pt ? 0 : node.pixelArea), 0);
+  const failCount = graph.summary.failedNodes;
+  return {
+    regions: graph.summary.totalNodes,
+    failCount,
+    fitCoverage: graph.summary.totalNodes ? (graph.summary.totalNodes - failCount) / graph.summary.totalNodes * 100 : 100,
+    failedAreaPercent: graph.width * graph.height ? failedPixels / (graph.width * graph.height) * 100 : 0,
+  };
+}
+
+function componentContainsHole(component: Component, imageWidth: number) {
+  const localWidth = component.maxX - component.minX + 3;
+  const localHeight = component.maxY - component.minY + 3;
+  const mask = new Uint8Array(localWidth * localHeight);
+  for (const pixel of component.pixels) {
+    const x = pixel % imageWidth - component.minX + 1;
+    const y = Math.floor(pixel / imageWidth) - component.minY + 1;
+    mask[y * localWidth + x] = 1;
+  }
+  const visited = new Uint8Array(mask.length);
+  const queue = [0];
+  visited[0] = 1;
+  for (let cursor = 0; cursor < queue.length; cursor++) {
+    const index = queue[cursor];
+    const x = index % localWidth;
+    const y = Math.floor(index / localWidth);
+    for (const [dx, dy] of NEIGHBORS) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || nx >= localWidth || ny < 0 || ny >= localHeight) continue;
+      const next = ny * localWidth + nx;
+      if (!mask[next] && !visited[next]) { visited[next] = 1; queue.push(next); }
+    }
+  }
+  for (let index = 0; index < mask.length; index++) if (!mask[index] && !visited[index]) return true;
+  return false;
+}
+
+/**
+ * Phase R2 dry-run only. Every recolor happens on a private clone and the
+ * simulated labels are never connected to production processing or approval.
+ */
+export async function simulateIterativeRegionOptimizerFromLabelMap(
+  sourceLabels: Uint8Array,
+  width: number,
+  height: number,
+  paints: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+  options: RegionOptimizerSimulationOptions = {},
+): Promise<RegionOptimizerSimulationResult> {
+  if (sourceLabels.length !== width * height || width < 1 || height < 1) throw new Error("Invalid optimizer label map dimensions");
+  if (!paints.length) throw new Error("Production palette is empty");
+  const originalLabels = sourceLabels.slice();
+  let labels = sourceLabels.slice();
+  const initialGraph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints, semanticRegions);
+  let graph = initialGraph;
+  const start = regionOptimizerSnapshot(initialGraph);
+  const maxPasses = Math.max(1, Math.min(20, options.maxPasses ?? 20));
+  const maxAcceptedOperations = Math.max(1, Math.min(5000, start.regions, options.maxAcceptedOperations ?? Math.min(5000, start.regions)));
+  const batchLimit = Math.max(1, Math.ceil(maxAcceptedOperations / maxPasses));
+  const semanticMask = new Uint8Array(labels.length);
+  const criticalMask = new Uint8Array(labels.length);
+  const descriptors = semanticRegions.map((region, ownerId) => {
+    const x0 = Math.max(0, Math.floor(region.x * width));
+    const y0 = Math.max(0, Math.floor(region.y * height));
+    const x1 = Math.min(width, Math.ceil((region.x + region.width) * width));
+    const y1 = Math.min(height, Math.ceil((region.y + region.height) * height));
+    const critical = region.kind === "eye" || region.kind === "text" || region.kind === "logo";
+    for (let y = y0; y < y1; y++) {
+      semanticMask.fill(1, y * width + x0, y * width + x1);
+      if (critical) criticalMask.fill(1, y * width + x0, y * width + x1);
+    }
+    return { ownerId, region, x0, y0, x1, y1, critical };
+  });
+  const totalSemanticPixels = semanticMask.reduce((sum, value) => sum + value, 0);
+  const initialColorCounts = new Uint32Array(paints.length);
+  for (const label of labels) initialColorCounts[label]++;
+  const rejectedOperationsByReason: Record<string, number> = {};
+  const reject = (reason: string) => { rejectedOperationsByReason[reason] = (rejectedOperationsByReason[reason] || 0) + 1; };
+  let acceptedOperations = 0;
+  let acceptedSemanticOperations = 0;
+  let acceptedNonSemanticOperations = 0;
+  let newFailuresCreated = 0;
+  let passes = 0;
+  let stopReason: RegionOptimizerSimulationResult["stopReason"] = "no-improving-safe-operation";
+  const rawTrajectory: Array<Omit<RegionOptimizerTrajectoryPoint, "acceptedOperationsPercent">> = [{ pass: 0, acceptedOperations: 0, ...start }];
+
+  const collectComponents = async (currentLabels: Uint8Array) => {
+    const components: Component[] = [];
+    const componentMap = new Int32Array(currentLabels.length);
+    componentMap.fill(-1);
+    await walkComponents(currentLabels, width, height, paints.length, (component) => {
+      const id = components.length;
+      components.push(component);
+      for (const pixel of component.pixels) componentMap[pixel] = id;
+    }, async () => undefined);
+    return { components, componentMap };
+  };
+  const semanticIdentity = (component: Component): RegionOptimizerSemanticIdentity => {
+    const ownerIds = new Set<number>();
+    const kinds = new Set<SemanticRegionKind>();
+    let semanticPixelCount = 0;
+    let criticalPixelCount = 0;
+    for (const pixel of component.pixels) {
+      if (semanticMask[pixel]) semanticPixelCount++;
+      if (criticalMask[pixel]) criticalPixelCount++;
+    }
+    for (const descriptor of descriptors) {
+      if (component.maxX < descriptor.x0 || component.minX >= descriptor.x1 || component.maxY < descriptor.y0 || component.minY >= descriptor.y1) continue;
+      let overlap = false;
+      for (const pixel of component.pixels) {
+        const x = pixel % width;
+        const y = Math.floor(pixel / width);
+        if (x >= descriptor.x0 && x < descriptor.x1 && y >= descriptor.y0 && y < descriptor.y1) { overlap = true; break; }
+      }
+      if (overlap) { ownerIds.add(descriptor.ownerId); kinds.add(descriptor.region.kind); }
+    }
+    return { ownerIds, kinds, semanticPixelCount, criticalPixelCount };
+  };
+
+  while (passes < maxPasses && acceptedOperations < maxAcceptedOperations) {
+    const { components } = await collectComponents(labels);
+    const identities = components.map(semanticIdentity);
+    const labelCounts = new Uint32Array(paints.length);
+    for (const label of labels) labelCounts[label]++;
+    const holeCache = new Map<number, boolean>();
+    type Candidate = { donorId: number; targetId: number; edge: RegionGraphEdge; semantic: boolean; makesPass: boolean };
+    const candidates: Candidate[] = [];
+    for (const edge of graph.edges) {
+      if (edge.classification !== "SAFE-CANDIDATE") continue;
+      const nodeA = graph.nodes[edge.regionA];
+      const nodeB = graph.nodes[edge.regionB];
+      let donorId: number;
+      let targetId: number;
+      if (!nodeA.fits5Pt && nodeB.fits5Pt) { donorId = edge.regionA; targetId = edge.regionB; }
+      else if (nodeA.fits5Pt && !nodeB.fits5Pt) { donorId = edge.regionB; targetId = edge.regionA; }
+      else if (nodeA.pixelArea < nodeB.pixelArea || (nodeA.pixelArea === nodeB.pixelArea && edge.regionA < edge.regionB)) { donorId = edge.regionA; targetId = edge.regionB; }
+      else { donorId = edge.regionB; targetId = edge.regionA; }
+      const donor = components[donorId];
+      const target = components[targetId];
+      const donorIdentity = identities[donorId];
+      const targetIdentity = identities[targetId];
+      if (donorIdentity.criticalPixelCount || targetIdentity.criticalPixelCount) { reject("hard-protected-eye-text-logo"); continue; }
+      const donorSemantic = donorIdentity.semanticPixelCount > 0;
+      const targetSemantic = targetIdentity.semanticPixelCount > 0;
+      let semantic = false;
+      if (donorSemantic || targetSemantic) {
+        const exactOwner = donorIdentity.ownerIds.size === 1 && targetIdentity.ownerIds.size === 1
+          && [...donorIdentity.ownerIds][0] === [...targetIdentity.ownerIds][0];
+        const exactKind = donorIdentity.kinds.size === 1 && targetIdentity.kinds.size === 1
+          && [...donorIdentity.kinds][0] === [...targetIdentity.kinds][0];
+        const kind = [...donorIdentity.kinds][0];
+        if (!exactOwner || !exactKind || !kind || !(["face", "hand", "key-detail"] as SemanticRegionKind[]).includes(kind)) { reject("ambiguous-semantic-ownership"); continue; }
+        if (donorIdentity.semanticPixelCount / donor.pixels.length < 0.95 || targetIdentity.semanticPixelCount / target.pixels.length < 0.95) { reject("partial-semantic-overlap"); continue; }
+        if (edge.labDistance > 8) { reject("protected-detail-boundary"); continue; }
+        semantic = true;
+      }
+      if (labelCounts[donor.label] === donor.pixels.length) { reject("would-eliminate-production-color"); continue; }
+      const sameTargetColorNeighbors = graph.nodes[donorId].neighboringRegionIds.filter((id) => components[id].label === target.label);
+      if (sameTargetColorNeighbors.length > 1) { reject("would-create-target-bridge"); continue; }
+      const hasHole = holeCache.get(donorId) ?? componentContainsHole(donor, width);
+      holeCache.set(donorId, hasHole);
+      if (hasHole) { reject("would-eliminate-hole-boundary"); continue; }
+      const makesPass = edge.resolvesFailedRegionIds.includes(donorId);
+      if (graph.nodes[targetId].fits5Pt && !makesPass) { reject("would-create-new-failure"); continue; }
+      candidates.push({ donorId, targetId, edge, semantic, makesPass });
+    }
+    candidates.sort((left, right) => Number(right.makesPass) - Number(left.makesPass)
+      || left.edge.labDistance - right.edge.labDistance
+      || right.edge.sharedBoundaryPx - left.edge.sharedBoundaryPx
+      || components[left.donorId].pixels.length - components[right.donorId].pixels.length
+      || left.donorId - right.donorId
+      || left.targetId - right.targetId);
+    const used = new Set<number>();
+    const usedTargetLabels = new Set<number>();
+    const batch: Candidate[] = [];
+    const remaining = maxAcceptedOperations - acceptedOperations;
+    for (const candidate of candidates) {
+      if (batch.length >= Math.min(batchLimit, remaining)) break;
+      if (used.has(candidate.donorId) || used.has(candidate.targetId)) continue;
+      const targetLabel = components[candidate.targetId].label;
+      if (usedTargetLabels.has(targetLabel)) continue;
+      used.add(candidate.donorId); used.add(candidate.targetId); batch.push(candidate);
+      usedTargetLabels.add(targetLabel);
+    }
+    if (!batch.length) { stopReason = "no-improving-safe-operation"; break; }
+
+    const trialLabels = labels.slice();
+    for (const operation of batch) {
+      const targetLabel = components[operation.targetId].label;
+      for (const pixel of components[operation.donorId].pixels) trialLabels[pixel] = targetLabel;
+    }
+    const trialGraph = await buildRegionGraphDiagnosticFromLabelMap(trialLabels, width, height, paints, semanticRegions);
+    const trialSnapshot = regionOptimizerSnapshot(trialGraph);
+    const currentSnapshot = regionOptimizerSnapshot(graph);
+    const { componentMap: trialComponentMap } = await collectComponents(trialLabels);
+    let batchNewFailures = 0;
+    for (const operation of batch) {
+      const targetPixel = components[operation.targetId].pixels[0];
+      const trialNode = trialGraph.nodes[trialComponentMap[targetPixel]];
+      if ((graph.nodes[operation.targetId].fits5Pt || graph.nodes[operation.donorId].fits5Pt) && !trialNode.fits5Pt) batchNewFailures++;
+    }
+    let batchCriticalChanges = 0;
+    for (let pixel = 0; pixel < labels.length; pixel++) if (criticalMask[pixel] && trialLabels[pixel] !== originalLabels[pixel]) batchCriticalChanges++;
+    const objectiveAccepted = trialSnapshot.failCount <= currentSnapshot.failCount
+      && trialSnapshot.fitCoverage + 1e-9 >= currentSnapshot.fitCoverage
+      && currentSnapshot.regions - trialSnapshot.regions === batch.length
+      && batchNewFailures === 0
+      && batchCriticalChanges === 0;
+    if (!objectiveAccepted) {
+      const rollbackReason = batchCriticalChanges ? "rollback-critical-pixel-change" : batchNewFailures ? "rollback-new-failure" : "rollback-objective-regression";
+      rejectedOperationsByReason[rollbackReason] = (rejectedOperationsByReason[rollbackReason] || 0) + batch.length;
+      stopReason = "no-improving-safe-operation";
+      break;
+    }
+    labels = trialLabels;
+    graph = trialGraph;
+    acceptedOperations += batch.length;
+    acceptedSemanticOperations += batch.filter((operation) => operation.semantic).length;
+    acceptedNonSemanticOperations += batch.filter((operation) => !operation.semantic).length;
+    newFailuresCreated += batchNewFailures;
+    passes++;
+    rawTrajectory.push({ pass: passes, acceptedOperations, ...trialSnapshot });
+  }
+  if (acceptedOperations >= maxAcceptedOperations) stopReason = "max-accepted-operations";
+  else if (passes >= maxPasses) stopReason = "max-passes";
+  const end = regionOptimizerSnapshot(graph);
+  const finalColorCounts = new Uint32Array(paints.length);
+  for (const label of labels) finalColorCounts[label]++;
+  const eliminatedColorCodes = paints.filter((_, index) => initialColorCounts[index] > 0 && finalColorCounts[index] === 0).map((paint) => paint.code);
+  let changedPixels = 0;
+  let changedSemanticPixels = 0;
+  let criticalPixelsChanged = 0;
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    if (labels[pixel] === originalLabels[pixel]) continue;
+    changedPixels++;
+    if (semanticMask[pixel]) changedSemanticPixels++;
+    if (criticalMask[pixel]) criticalPixelsChanged++;
+  }
+  const trajectory = rawTrajectory.map((point) => ({
+    ...point,
+    acceptedOperationsPercent: acceptedOperations ? point.acceptedOperations / acceptedOperations * 100 : 0,
+  }));
+  const nearestTrajectory = (target: number) => trajectory.reduce((best, point) =>
+    Math.abs(point.acceptedOperationsPercent - target) < Math.abs(best.acceptedOperationsPercent - target) ? point : best, trajectory[0]);
+  return {
+    width,
+    height,
+    start,
+    end,
+    acceptedOperations,
+    acceptedSemanticOperations,
+    acceptedNonSemanticOperations,
+    rejectedOperationsByReason,
+    regionReductionPercent: start.regions ? (start.regions - end.regions) / start.regions * 100 : 0,
+    failReductionPercent: start.failCount ? (start.failCount - end.failCount) / start.failCount * 100 : 0,
+    semanticAreaChangedPercent: totalSemanticPixels ? changedSemanticPixels / totalSemanticPixels * 100 : 0,
+    rasterAreaChangedPercent: labels.length ? changedPixels / labels.length * 100 : 0,
+    colorsBefore: [...initialColorCounts].filter(Boolean).length,
+    colorsAfter: [...finalColorCounts].filter(Boolean).length,
+    eliminatedColorCodes,
+    criticalPixelsChanged,
+    newFailuresCreated,
+    passes,
+    maxPasses,
+    maxAcceptedOperations,
+    capHit: stopReason !== "no-improving-safe-operation",
+    stopReason,
+    finalRasterCheckpoint: checkpointIdentity(labels, paints, width, height),
+    finalGraphCheckpoint: regionGraphCheckpoint(graph),
+    trajectory,
+    trajectoryCheckpoints: { "1%": nearestTrajectory(1), "5%": nearestTrajectory(5), "10%": nearestTrajectory(10), "25%": nearestTrajectory(25) },
+    finalGraph: graph,
+    simulatedLabels: labels,
+  };
+}
+
+export async function simulateIterativeRegionOptimizer(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  semanticRegions: SemanticRegion[] = [],
+  options: RegionOptimizerSimulationOptions = {},
+): Promise<RegionOptimizerSimulationResult> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  const resizeScale = Math.min(1, 3000 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * resizeScale));
+  const height = Math.max(1, Math.round(image.height * resizeScale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, 0, 0, width, height);
+  const rgba = context.getImageData(0, 0, width, height).data;
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    if (rgba[pixel * 4 + 3] !== 255) throw new Error("Optimizer raster must be fully opaque");
+    rgb[pixel * 3] = rgba[pixel * 4]; rgb[pixel * 3 + 1] = rgba[pixel * 4 + 1]; rgb[pixel * 3 + 2] = rgba[pixel * 4 + 2];
+  }
+  const approved = approvedPaletteAssignment(rgb, palette);
+  const labels = new Uint8Array(width * height);
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    const key = (rgb[pixel * 3] << 16) | (rgb[pixel * 3 + 1] << 8) | rgb[pixel * 3 + 2];
+    labels[pixel] = approved.assignment.get(key) ?? 0;
+  }
+  return simulateIterativeRegionOptimizerFromLabelMap(labels, width, height, approved.selectedPaints, semanticRegions, options);
 }
 
 export async function createProductionFailureOverlay(
