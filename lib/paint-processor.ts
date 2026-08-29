@@ -5,6 +5,14 @@ export type ProductionPaint = {
   hex: string;
 };
 
+export type ProductionPaletteSample = {
+  r: number;
+  g: number;
+  b: number;
+  count?: number;
+  weight?: number;
+};
+
 export type SemanticRegionKind = "face" | "eye" | "text" | "logo" | "hand" | "key-detail";
 
 export type SemanticRegion = {
@@ -529,6 +537,95 @@ function choosePalette(samples: ColorSample[], paletteLabs: Lab[], requested: nu
     }
   }
   return selected.map((index) => candidateIndexes[index]);
+}
+
+function closestPaletteIndex(sample: ColorSample, paletteLabs: Lab[]) {
+  let closest = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < paletteLabs.length; index++) {
+    const distance = labDistance(sample.lab, paletteLabs[index]);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      closest = index;
+    }
+  }
+  return closest;
+}
+
+function chooseReducedPalette(samples: ColorSample[], paletteLabs: Lab[], requested: number) {
+  const count = Math.max(1, Math.min(32, Math.max(24, requested), paletteLabs.length));
+  const totalPixels = samples.reduce((sum, sample) => sum + sample.count, 0);
+  const structuralSamples = samples.filter((sample) => sample.count >= Math.max(1, totalPixels * 0.0005));
+  const anchorSamples = structuralSamples.length ? structuralSamples : samples;
+  const darkest = anchorSamples.reduce((best, sample) => sample.lab[0] < best.lab[0] ? sample : best);
+  const lightest = anchorSamples.reduce((best, sample) => sample.lab[0] > best.lab[0] ? sample : best);
+  const accent = anchorSamples.reduce((best, sample) => {
+    const score = Math.hypot(sample.lab[1], sample.lab[2]) * Math.log1p(sample.count);
+    const bestScore = Math.hypot(best.lab[1], best.lab[2]) * Math.log1p(best.count);
+    return score > bestScore ? sample : best;
+  });
+  const anchors = [darkest, lightest, accent].map((sample) => closestPaletteIndex(sample, paletteLabs));
+  const selected = [...new Set([...anchors, ...choosePalette(samples, paletteLabs, count)])].slice(0, count);
+  if (selected.length < count) {
+    for (let index = 0; index < paletteLabs.length && selected.length < count; index++) {
+      if (!selected.includes(index)) selected.push(index);
+    }
+  }
+  return selected.sort((left, right) => left - right);
+}
+
+export function selectReducedProductionColorsFromSamples(
+  samples: ProductionPaletteSample[],
+  palette: ProductionPaint[],
+  requestedColors = 28,
+) {
+  if (!palette.length) throw new Error("Production palette is empty");
+  if (!samples.length) throw new Error("Production palette samples are empty");
+  const colorSamples = samples.map((sample, index): ColorSample => ({
+    key: index,
+    count: Math.max(1, Math.round(sample.count ?? 1)),
+    weight: Math.max(0.000001, sample.weight ?? sample.count ?? 1),
+    lab: rgbToLab(sample.r, sample.g, sample.b),
+  }));
+  const paletteLabs = palette.map((paint) => {
+    const [r, g, b] = hexToRgb(paint.hex);
+    return rgbToLab(r, g, b);
+  });
+  return chooseReducedPalette(colorSamples, paletteLabs, requestedColors).map((index) => palette[index]);
+}
+
+export async function selectReducedProductionColors(
+  fileUrl: string,
+  palette: ProductionPaint[],
+  requestedColors = 28,
+): Promise<ProductionPaint[]> {
+  if (!palette.length) throw new Error("Production palette is empty");
+  const image = new Image();
+  image.src = fileUrl;
+  await image.decode();
+  const scale = Math.min(1, 420 / Math.max(image.width, image.height));
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true })!;
+  context.imageSmoothingEnabled = true;
+  context.drawImage(image, 0, 0, width, height);
+  const source = context.getImageData(0, 0, width, height).data;
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let pixel = 0; pixel < width * height; pixel++) {
+    rgb[pixel * 3] = source[pixel * 4];
+    rgb[pixel * 3 + 1] = source[pixel * 4 + 1];
+    rgb[pixel * 3 + 2] = source[pixel * 4 + 2];
+  }
+  const edges = computeEdgeStrength(rgb, width, height);
+  const samples = buildSamples(edgeAwareSmooth(rgb, width, height), edges);
+  const paletteLabs = palette.map((paint) => {
+    const [r, g, b] = hexToRgb(paint.hex);
+    return rgbToLab(r, g, b);
+  });
+  return chooseReducedPalette(samples, paletteLabs, requestedColors).map((index) => palette[index]);
 }
 
 export async function selectProductionColors(

@@ -50,5 +50,8 @@ Production-correction output may use only colors from the selected production pa
 ## D-016 — Phase A3 compresses active colors only during correction
 In `global-rebuild`, the selected production palette remains an allowed pool while the corrected portrait/people/wedding preview targets 24–32 actually used colors and aggressively consolidates near-identical tones in skin, white clothing, background, hair and bouquet. `local-repair` also avoids near-duplicate tones but has no hard active-color budget. The actual post-correction active-color count is diagnostic state only; it does not change validator thresholds or the immutable Final Region Map contract.
 
+## D-017 — Global rebuild uses a deterministic reduced palette before final snap
+Only `global-rebuild` derives an image-driven 28-color subset (bounded to 24–32 and to the available pool) from the AI-corrected image before final palette snapping. The subset contains only paints from the selected production palette, preserves representative dark, light and saturated structural colors, and is then used consistently by palette snap, semantic analysis, Phase B, Phase C and readiness. The allowed-pool size and the actually used color count remain separate diagnostics; the master palette is not mutated. Standard generation and `local-repair` retain their existing palette behavior.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

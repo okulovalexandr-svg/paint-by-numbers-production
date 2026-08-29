@@ -14,6 +14,7 @@ import {
   correctNonSemanticGeometry,
   correctNonSemanticNoise,
   processPaintImage,
+  selectReducedProductionColors,
   selectProductionColors,
   snapImageToProductionPalette,
   validateProductionReadiness,
@@ -69,6 +70,7 @@ type Project = {
   semanticFailCount?: number;
   nonSemanticFailCount?: number;
   productionCorrectionStrategy?: ProductionCorrectionStrategy;
+  productionAllowedPaletteCount?: number;
   productionActiveColorCount?: number;
 };
 
@@ -506,6 +508,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
     costUpdate: { semanticCostUsd?: number; operationCostUsd?: number; generationIncrement?: number } = {},
     correctionStrategy?: ProductionCorrectionStrategy,
     activeColorCount?: number,
+    allowedPaletteCount?: number,
   ) {
     const overlay = await createProductionFailureOverlay(failedRaster, selectedPalette, semanticRegions);
     if (overlay.semanticFailCount + overlay.nonSemanticFailCount !== readiness.failCount) {
@@ -522,6 +525,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       semanticFailCount: overlay.semanticFailCount,
       nonSemanticFailCount: overlay.nonSemanticFailCount,
       productionCorrectionStrategy: correctionStrategy,
+      productionAllowedPaletteCount: allowedPaletteCount,
       productionActiveColorCount: activeColorCount,
       productionPreviewUrl: undefined,
       productionSchemeUrl: undefined,
@@ -592,7 +596,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
     setProductionError("");
     const sourceUrl = URL.createObjectURL(file);
     setShowAiDraft(false);
-    const updated = { ...activeProject, sourceUrl, aiPreviewUrl: undefined, aiPalette: undefined, productionPreviewUrl: undefined, productionSchemeUrl: undefined, productionSvgUrl: undefined, productionPdfUrl: undefined, approvedPreviewUrl: undefined, previewUrl: undefined, schemeUrl: undefined, svgUrl: undefined, pdfUrl: undefined, checkpointId: undefined, usedColorIds: undefined, usedPaints: undefined, regionCount: undefined, numberCount: undefined, removedAreas: undefined, unlabeledRegionCount: undefined, stackedNumberCount: undefined, repairedRegionCount: undefined, protectedRegionCount: undefined, minimumRegionArea: undefined, semanticRegions: undefined, semanticPreviewUrl: undefined, semanticAnalysisCostUsd: undefined, productionReadiness: undefined, productionFailureOverlayUrl: undefined, semanticFailCount: undefined, nonSemanticFailCount: undefined, productionCorrectionStrategy: undefined, productionActiveColorCount: undefined, aiCostUsd: 0, lastAiCostUsd: undefined, aiGenerationCount: 0, status: "Черновик" as ProjectStatus };
+    const updated = { ...activeProject, sourceUrl, aiPreviewUrl: undefined, aiPalette: undefined, productionPreviewUrl: undefined, productionSchemeUrl: undefined, productionSvgUrl: undefined, productionPdfUrl: undefined, approvedPreviewUrl: undefined, previewUrl: undefined, schemeUrl: undefined, svgUrl: undefined, pdfUrl: undefined, checkpointId: undefined, usedColorIds: undefined, usedPaints: undefined, regionCount: undefined, numberCount: undefined, removedAreas: undefined, unlabeledRegionCount: undefined, stackedNumberCount: undefined, repairedRegionCount: undefined, protectedRegionCount: undefined, minimumRegionArea: undefined, semanticRegions: undefined, semanticPreviewUrl: undefined, semanticAnalysisCostUsd: undefined, productionReadiness: undefined, productionFailureOverlayUrl: undefined, semanticFailCount: undefined, nonSemanticFailCount: undefined, productionCorrectionStrategy: undefined, productionAllowedPaletteCount: undefined, productionActiveColorCount: undefined, aiCostUsd: 0, lastAiCostUsd: undefined, aiGenerationCount: 0, status: "Черновик" as ProjectStatus };
     setActiveProject(updated);
     setProjects((items) => items.map((item) => item.id === updated.id ? updated : item));
     setSection("editor");
@@ -643,6 +647,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       semanticFailCount: undefined,
       nonSemanticFailCount: undefined,
       productionCorrectionStrategy: undefined,
+      productionAllowedPaletteCount: undefined,
       productionActiveColorCount: undefined,
       status: "Нужны правки",
     };
@@ -761,6 +766,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       semanticFailCount: undefined,
       nonSemanticFailCount: undefined,
       productionCorrectionStrategy: undefined,
+      productionAllowedPaletteCount: undefined,
       productionActiveColorCount: undefined,
       status: "Нужны правки",
       updated: "Защищённые детали проверены",
@@ -897,6 +903,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         semanticFailCount: 0,
         nonSemanticFailCount: 0,
         productionCorrectionStrategy: undefined,
+        productionAllowedPaletteCount: undefined,
         productionActiveColorCount: undefined,
         colors: result.usedColors.length,
         status: "Нужны правки",
@@ -1056,6 +1063,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         semanticFailCount: 0,
         nonSemanticFailCount: 0,
         productionCorrectionStrategy: undefined,
+        productionAllowedPaletteCount: undefined,
         productionActiveColorCount: undefined,
         status: "Нужны правки",
         updated: "Производственная карта на проверке",
@@ -1122,16 +1130,20 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       setIsProcessing(true);
       setProcessingProgress(4);
       setProcessingStage("Возвращаем исправление в выбранную производственную палитру…");
-      const palettePreview = await snapImageToProductionPalette(payload.image, selectedProductionPalette);
+      const correctionPalette = correctionStrategy === "global-rebuild"
+        ? await selectReducedProductionColors(payload.image, selectedProductionPalette, 28)
+        : selectedProductionPalette;
+      const allowedPaletteCount = activeProject.productionAllowedPaletteCount ?? selectedProductionPalette.length;
+      const palettePreview = await snapImageToProductionPalette(payload.image, correctionPalette);
       setProcessingStage("Повторно проверяем важные детали…");
       const semantic = await analyzeSemanticPreview(palettePreview);
       setProcessingStage("Убираем безопасные шумовые микрообласти…");
-      const noiseCorrection = await correctNonSemanticNoise(palettePreview, selectedProductionPalette, semantic.regions);
+      const noiseCorrection = await correctNonSemanticNoise(palettePreview, correctionPalette, semantic.regions);
       setProcessingStage("Расширяем безопасные узкие области…");
-      const geometryCorrection = await correctNonSemanticGeometry(noiseCorrection.correctedRaster, selectedProductionPalette, semantic.regions);
-      const activeColorCount = await countActiveProductionColors(geometryCorrection.correctedRaster, selectedProductionPalette);
+      const geometryCorrection = await correctNonSemanticGeometry(noiseCorrection.correctedRaster, correctionPalette, semantic.regions);
+      const activeColorCount = await countActiveProductionColors(geometryCorrection.correctedRaster, correctionPalette);
       setProcessingStage("Проверяем готовность каждой области к номеру 5 pt…");
-      const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, selectedProductionPalette, {
+      const readiness = await validateProductionReadiness(geometryCorrection.correctedRaster, correctionPalette, {
         semanticAvailable: semantic.regions.length > 0,
       });
       const operationCost = generationCost + semantic.costUsd;
@@ -1139,12 +1151,13 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         const failed = await readinessFailureProject(
           activeProject,
           geometryCorrection.correctedRaster,
-          selectedProductionPalette,
+          correctionPalette,
           semantic.regions,
           readiness,
           { semanticCostUsd: semantic.costUsd, operationCostUsd: operationCost, generationIncrement: 1 },
           correctionStrategy,
           activeColorCount,
+          allowedPaletteCount,
         );
         setActiveProject(failed);
         setProjects((items) => items.map((item) => item.id === failed.id ? failed : item));
@@ -1156,8 +1169,8 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
       setProcessingStage("Готовим исправленную карту к обычному визуальному утверждению…");
       const result = await processPaintImage(
         geometryCorrection.correctedRaster,
-        selectedProductionPalette,
-        selectedProductionPalette.length,
+        correctionPalette,
+        correctionPalette.length,
         "approved",
         {
           productionReadiness: readiness,
@@ -1174,7 +1187,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         ...activeProject,
         aiPreviewUrl: result.preview,
         previewUrl: result.preview,
-        aiPalette: selectedProductionPalette,
+        aiPalette: correctionPalette,
         productionPreviewUrl: result.preview,
         productionSchemeUrl: result.scheme,
         productionSvgUrl: result.svg,
@@ -1205,6 +1218,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
         semanticFailCount: 0,
         nonSemanticFailCount: 0,
         productionCorrectionStrategy: correctionStrategy,
+        productionAllowedPaletteCount: allowedPaletteCount,
         productionActiveColorCount: activeColorCount,
         colors: result.usedColors.length,
         status: "Нужны правки",
@@ -1490,7 +1504,7 @@ export default function Studio({ viewer }: { viewer: { name: string; email: stri
                     </div>
                   </section>
                 )}
-                <div className="api-cost-bar"><div><small>API по этому сюжету</small><b>${(activeProject.aiCostUsd || 0).toFixed(3)}</b></div><div><small>Генераций изображения</small><b>{activeProject.aiGenerationCount || 0}</b></div><div><small>Последняя API-операция</small><b>{activeProject.lastAiCostUsd ? `$${activeProject.lastAiCostUsd.toFixed(3)}` : "$0"}</b></div><p>API создаёт изображение и один раз распознаёт важные зоны. Палитра, области, контуры, цифры, SVG и PDF затем строятся локально за $0.{activeProject.productionCorrectionStrategy && <> Стратегия correction: <b>{activeProject.productionCorrectionStrategy}</b>.</>}{activeProject.productionActiveColorCount !== undefined && <> Активных цветов после correction: <b>{activeProject.productionActiveColorCount}</b>.</>}</p></div>
+                <div className="api-cost-bar"><div><small>API по этому сюжету</small><b>${(activeProject.aiCostUsd || 0).toFixed(3)}</b></div><div><small>Генераций изображения</small><b>{activeProject.aiGenerationCount || 0}</b></div><div><small>Последняя API-операция</small><b>{activeProject.lastAiCostUsd ? `$${activeProject.lastAiCostUsd.toFixed(3)}` : "$0"}</b></div><p>API создаёт изображение и один раз распознаёт важные зоны. Палитра, области, контуры, цифры, SVG и PDF затем строятся локально за $0.{activeProject.productionCorrectionStrategy && <> Стратегия correction: <b>{activeProject.productionCorrectionStrategy}</b>.</>}{activeProject.productionAllowedPaletteCount !== undefined && <> Разрешённый пул: <b>{activeProject.productionAllowedPaletteCount}</b>.</>}{activeProject.productionActiveColorCount !== undefined && <> Активных цветов после correction: <b>{activeProject.productionActiveColorCount}</b>.</>}</p></div>
                 <div className="canvas-tabs"><button className="active">Три вида</button><button>Превью</button><button>Схема</button><span>{activeProject.regionCount ? `${activeProject.regionCount} областей · ${activeProject.numberCount} номеров` : "LAB-подбор · границы деталей"}</span></div>
                 <div className="canvas-grid">
                   <figure><figcaption><span>01</span> Оригинал</figcaption><div className="artboard source-board">{activeProject.sourceUrl ? <img src={activeProject.sourceUrl} alt="Загруженный оригинал"/> : <button onClick={() => uploadRef.current?.click()}><Icon name="upload" size={28}/><b>Загрузить изображение</b><small>JPG или PNG до 25 МБ · оптимизируется автоматически</small></button>}</div></figure>
