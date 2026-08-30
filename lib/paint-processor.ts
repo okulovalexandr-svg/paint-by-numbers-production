@@ -440,6 +440,148 @@ export type SemanticPlaneReconstructionResult = {
   simulatedLabels: Uint8Array;
 };
 
+export type SourceEdgeAuditMode = "golden" | "semantic";
+export type SourceEdgeAuditThreshold = 4 | 8 | 12;
+export type SourceEdgeAuditKind = "face" | "hand" | "key-detail";
+export type SourceEdgeEndpointReadiness = "FAIL-FAIL" | "FAIL-PASS" | "PASS-PASS";
+
+export type SourceEdgeDistribution = {
+  count: number;
+  mean: number;
+  median: number;
+  p50: number;
+  p90: number;
+  max: number;
+};
+
+export type SourceEdgeWeakRate = {
+  count: number;
+  rate: number;
+};
+
+export type SourceEdgeAuditEdge = {
+  regionA: number;
+  regionB: number;
+  sharedBoundaryPx: number;
+  sharedBoundaryMm: number;
+  approvedPaletteLabDelta: number;
+  sourceGradient: SourceEdgeDistribution;
+  eligible: boolean;
+  exclusionReason?:
+    | "semantic-ownership-required"
+    | "ambiguous-ownership"
+    | "not-exactly-one-owner"
+    | "cross-owner"
+    | "incompatible-kind"
+    | "critical-ownership";
+  endpointReadiness?: SourceEdgeEndpointReadiness;
+  ownerId?: number;
+  kind?: SourceEdgeAuditKind;
+};
+
+export type SourceEdgeClassSummary = {
+  edgeCount: number;
+  sourceP90: SourceEdgeDistribution;
+  approvedPaletteLabDelta: SourceEdgeDistribution;
+  weakEdges: Record<SourceEdgeAuditThreshold, SourceEdgeWeakRate>;
+};
+
+export type SourceEdgeOracleCluster = {
+  firstRegionId: number;
+  ownerId: number;
+  kind: SourceEdgeAuditKind;
+  originalRegionCount: number;
+  failCount: number;
+  passCount: number;
+  areaMm2: number;
+  fits5Pt: boolean;
+};
+
+export type SourceEdgeOracleOwnerBreakdown = {
+  connectedClusters: number;
+  oraclePlaneClusters: number;
+  oracleResolvableFail: number;
+  theoreticalRegionReduction: number;
+  passRegionsConsumed: number;
+  passRegionsConsumedForFailGain: number;
+};
+
+export type SourceEdgeOracleThresholdResult = {
+  threshold: SourceEdgeAuditThreshold;
+  weakEligibleEdges: number;
+  weakEligibleEdgeRate: number;
+  connectedClusters: number;
+  oraclePlaneClusters: number;
+  oracleResolvableFail: number;
+  oracleResolvableFailPercent: number;
+  theoreticalRegionReduction: number;
+  theoreticalRegionReductionPercent: number;
+  passRegionsConsumed: number;
+  passRegionsConsumedForFailGain: number;
+  ownerBreakdown: Record<SourceEdgeAuditKind, SourceEdgeOracleOwnerBreakdown>;
+  largestClusters: SourceEdgeOracleCluster[];
+};
+
+export type SourceEdgeAuditRuntime = {
+  decodeMs: number;
+  sourceNormalizationMs: number;
+  decodeNormalizationMs: number;
+  baselineGraphMs: number;
+  boundarySamplingMs: number;
+  graphClusteringMs: number;
+  union5PtChecksMs: number;
+  totalMs: number;
+};
+
+export type SourceEdgeAuditInput = {
+  mode: SourceEdgeAuditMode;
+  sourcePixels: Uint8Array | Uint8ClampedArray;
+  sourceWidth: number;
+  sourceHeight: number;
+  sourceChannels: 3 | 4;
+  labels: Uint8Array;
+  width: number;
+  height: number;
+  paints: ProductionPaint[];
+  semanticOwnership?: RegionAlignedSemanticOwnershipResult;
+  decodeMs?: number;
+};
+
+export type SourceEdgeAuditResult = {
+  mode: SourceEdgeAuditMode;
+  width: number;
+  height: number;
+  source: {
+    width: number;
+    height: number;
+    channels: 3 | 4;
+    aspectMismatchPercent: number;
+    decodedPixelCheckpoint: string;
+    normalizedPixelCheckpoint: string;
+  };
+  baseline: {
+    currentRegions: number;
+    failCount: number;
+    semanticFailCount: number;
+    eligibleSemanticFailCount: number;
+    fitCoverage: number;
+    failedAreaPixels: number;
+    failedAreaMm2: number;
+    failedAreaPercent: number;
+  };
+  internalBoundaryEdges: number;
+  allBoundarySourceP90: SourceEdgeDistribution;
+  eligibleSemanticAdjacencyCount: number;
+  edgeClasses: Record<SourceEdgeEndpointReadiness, SourceEdgeClassSummary>;
+  goldenWeakBoundaryRate?: Record<SourceEdgeAuditThreshold, SourceEdgeWeakRate>;
+  oracleByThreshold?: Record<SourceEdgeAuditThreshold, SourceEdgeOracleThresholdResult>;
+  edges: SourceEdgeAuditEdge[];
+  runtime: SourceEdgeAuditRuntime;
+  decodedSourceUnchanged: boolean;
+  labelMapUnchanged: boolean;
+  auditCheckpoint: string;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -4596,6 +4738,487 @@ export async function simulateValidatorSeededSemanticPlaneReconstructionFromLabe
     finalGraphCheckpoint: regionGraphCheckpoint(graph),
     finalGraph: graph,
     simulatedLabels: labels,
+  };
+}
+
+const SOURCE_EDGE_AUDIT_THRESHOLDS = [4, 8, 12] as const;
+
+function sourceEdgeDistribution(values: number[]): SourceEdgeDistribution {
+  if (!values.length) return { count: 0, mean: 0, median: 0, p50: 0, p90: 0, max: 0 };
+  const sorted = [...values].sort((left, right) => left - right);
+  const percentile = (ratio: number) => sorted[Math.max(0, Math.ceil(sorted.length * ratio) - 1)];
+  const middle = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  return {
+    count: sorted.length,
+    mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length,
+    median,
+    p50: percentile(0.50),
+    p90: percentile(0.90),
+    max: sorted[sorted.length - 1],
+  };
+}
+
+function sourceEdgePixelCheckpoint(
+  prefix: "SRC" | "NRM" | "LBL",
+  pixels: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  channels: number,
+) {
+  let hash = 0x811c9dc5;
+  const update = (value: number) => {
+    hash ^= value & 255;
+    hash = Math.imul(hash, 0x01000193);
+  };
+  const updateNumber = (value: number) => {
+    update(value); update(value >>> 8); update(value >>> 16); update(value >>> 24);
+  };
+  updateNumber(width); updateNumber(height); updateNumber(channels);
+  for (const value of pixels) update(value);
+  return `${prefix}-${(hash >>> 0).toString(16).padStart(8, "0").toUpperCase()}`;
+}
+
+function emptySourceEdgeOwnerBreakdown(): Record<SourceEdgeAuditKind, SourceEdgeOracleOwnerBreakdown> {
+  const empty = (): SourceEdgeOracleOwnerBreakdown => ({
+    connectedClusters: 0,
+    oraclePlaneClusters: 0,
+    oracleResolvableFail: 0,
+    theoreticalRegionReduction: 0,
+    passRegionsConsumed: 0,
+    passRegionsConsumedForFailGain: 0,
+  });
+  return { face: empty(), hand: empty(), "key-detail": empty() };
+}
+
+/**
+ * Phase W1 diagnostic only. It samples a deterministically normalized copy of
+ * original-source pixels across the immutable palette-region graph, then runs
+ * temporary union geometry through the existing 5 pt placement test. It never
+ * writes a candidate raster, chooses a plane colour or enters production/UI.
+ */
+export async function auditSourceEdgeSeparabilityFromLabelMap(
+  input: SourceEdgeAuditInput,
+): Promise<SourceEdgeAuditResult> {
+  const startedAt = performance.now();
+  const {
+    mode,
+    sourcePixels,
+    sourceWidth,
+    sourceHeight,
+    sourceChannels,
+    labels: sourceLabels,
+    width,
+    height,
+    paints,
+    semanticOwnership,
+  } = input;
+  const decodeMs = Math.max(0, input.decodeMs ?? 0);
+  if (mode !== "golden" && mode !== "semantic") throw new Error("Invalid source-edge audit mode");
+  if (!Number.isInteger(sourceWidth) || sourceWidth < 1 || !Number.isInteger(sourceHeight) || sourceHeight < 1) {
+    throw new Error("Invalid decoded source dimensions");
+  }
+  if (sourceChannels !== 3 && sourceChannels !== 4) throw new Error("Decoded source must have RGB or RGBA channels");
+  if (sourcePixels.length !== sourceWidth * sourceHeight * sourceChannels) throw new Error("Decoded source pixel length does not match its dimensions");
+  if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1 || sourceLabels.length !== width * height) {
+    throw new Error("Invalid source-edge label map dimensions");
+  }
+  if (!paints.length) throw new Error("Source-edge audit palette is empty");
+  if (sourceLabels.some((label) => label >= paints.length)) throw new Error("Source-edge label is outside the palette");
+  if (mode === "semantic" && !semanticOwnership) throw new Error("Semantic source-edge audit requires accepted S1 ownership");
+
+  const sourceAspect = sourceWidth / sourceHeight;
+  const labelAspect = width / height;
+  const aspectMismatchPercent = Math.abs(sourceAspect - labelAspect) / labelAspect * 100;
+  if (aspectMismatchPercent > 0.5 + 1e-12) {
+    throw new Error(`SOURCE_ASPECT_RATIO_MISMATCH: decoded ${sourceWidth}x${sourceHeight}, labels ${width}x${height}, ${aspectMismatchPercent.toFixed(6)}%`);
+  }
+
+  const decodedPixelCheckpoint = sourceEdgePixelCheckpoint("SRC", sourcePixels, sourceWidth, sourceHeight, sourceChannels);
+  const inputLabelCheckpoint = sourceEdgePixelCheckpoint("LBL", sourceLabels, width, height, 1);
+  const labels = sourceLabels.slice();
+  const normalizationStartedAt = performance.now();
+  const normalizedSource = new Uint8ClampedArray(width * height * 3);
+  // Full-frame nearest-neighbour mapping is deliberate: it invents no crop and
+  // introduces no blur or synthetic colours before boundary measurement.
+  for (let y = 0; y < height; y++) {
+    const sourceY = Math.min(sourceHeight - 1, Math.floor((y + 0.5) * sourceHeight / height));
+    for (let x = 0; x < width; x++) {
+      const sourceX = Math.min(sourceWidth - 1, Math.floor((x + 0.5) * sourceWidth / width));
+      const sourceOffset = (sourceY * sourceWidth + sourceX) * sourceChannels;
+      if (sourceChannels === 4 && sourcePixels[sourceOffset + 3] !== 255) {
+        throw new Error("Decoded source must be fully opaque; W1 will not invent alpha compositing");
+      }
+      const targetOffset = (y * width + x) * 3;
+      normalizedSource[targetOffset] = sourcePixels[sourceOffset];
+      normalizedSource[targetOffset + 1] = sourcePixels[sourceOffset + 1];
+      normalizedSource[targetOffset + 2] = sourcePixels[sourceOffset + 2];
+    }
+  }
+  const sourceNormalizationMs = performance.now() - normalizationStartedAt;
+  const normalizedPixelCheckpoint = sourceEdgePixelCheckpoint("NRM", normalizedSource, width, height, 3);
+
+  const baselineStartedAt = performance.now();
+  const graph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints);
+  const components: Component[] = [];
+  const componentMap = new Int32Array(labels.length);
+  componentMap.fill(-1);
+  await walkComponents(labels, width, height, paints.length, (component) => {
+    const regionId = components.length;
+    components.push(component);
+    for (const pixel of component.pixels) componentMap[pixel] = regionId;
+  }, async () => undefined);
+  if (components.length !== graph.nodes.length) throw new Error("Source-edge component identity diverged from the accepted region graph");
+  if (semanticOwnership) {
+    if (semanticOwnership.width !== width || semanticOwnership.height !== height
+      || semanticOwnership.semanticMask.length !== labels.length
+      || semanticOwnership.criticalMask.length !== labels.length
+      || semanticOwnership.regions.length !== components.length) {
+      throw new Error("Accepted S1 ownership does not match the source-edge label map");
+    }
+    for (let regionId = 0; regionId < components.length; regionId++) {
+      const owned = semanticOwnership.regions[regionId];
+      if (owned.regionId !== regionId || owned.pixelArea !== components[regionId].pixels.length) {
+        throw new Error("Accepted S1 region identity does not match the source-edge component order");
+      }
+    }
+    for (const owner of semanticOwnership.ownerMasks) {
+      if (owner.mask.length !== labels.length) throw new Error("Accepted S1 owner mask dimensions do not match W1");
+    }
+  }
+  const baselineGraphMs = performance.now() - baselineStartedAt;
+
+  const boundarySamplingStartedAt = performance.now();
+  const edgeGradients = new Map<string, number[]>();
+  const labCache = new Map<number, Lab>();
+  const sourceLabAt = (pixel: number) => {
+    const offset = pixel * 3;
+    const r = normalizedSource[offset];
+    const g = normalizedSource[offset + 1];
+    const b = normalizedSource[offset + 2];
+    const key = (r << 16) | (g << 8) | b;
+    let lab = labCache.get(key);
+    if (!lab) { lab = rgbToLab(r, g, b); labCache.set(key, lab); }
+    return lab;
+  };
+  const sourceDelta = (left: number, right: number) => Math.sqrt(labDistance(sourceLabAt(left), sourceLabAt(right)));
+  const addBoundarySegment = (leftPixel: number, rightPixel: number, outerLeft?: number, outerRight?: number) => {
+    const leftRegion = componentMap[leftPixel];
+    const rightRegion = componentMap[rightPixel];
+    if (leftRegion === rightRegion) return;
+    const regionA = Math.min(leftRegion, rightRegion);
+    const regionB = Math.max(leftRegion, rightRegion);
+    const gradients = [sourceDelta(leftPixel, rightPixel)];
+    if (outerLeft !== undefined && outerRight !== undefined) gradients.push(sourceDelta(outerLeft, outerRight));
+    gradients.sort((left, right) => left - right);
+    const robustGradient = gradients.length === 1 ? gradients[0] : (gradients[0] + gradients[1]) / 2;
+    const key = `${regionA}:${regionB}`;
+    const samples = edgeGradients.get(key);
+    if (samples) samples.push(robustGradient);
+    else edgeGradients.set(key, [robustGradient]);
+  };
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x;
+    if (x + 1 < width) {
+      addBoundarySegment(pixel, pixel + 1, x > 0 && x + 2 < width ? pixel - 1 : undefined, x > 0 && x + 2 < width ? pixel + 2 : undefined);
+    }
+    if (y + 1 < height) {
+      addBoundarySegment(pixel, pixel + width, y > 0 && y + 2 < height ? pixel - width : undefined, y > 0 && y + 2 < height ? pixel + width * 2 : undefined);
+    }
+  }
+
+  const compatibleKinds = new Set<SemanticRegionKind>(["face", "hand", "key-detail"]);
+  const classifySemanticEdge = (regionA: number, regionB: number) => {
+    if (!semanticOwnership) return { eligible: false as const, exclusionReason: "semantic-ownership-required" as const };
+    const left = semanticOwnership.regions[regionA];
+    const right = semanticOwnership.regions[regionB];
+    if (left.ambiguous || right.ambiguous) return { eligible: false as const, exclusionReason: "ambiguous-ownership" as const };
+    if (left.ownerIds.length !== 1 || right.ownerIds.length !== 1) return { eligible: false as const, exclusionReason: "not-exactly-one-owner" as const };
+    if (left.ownerIds[0] !== right.ownerIds[0]) return { eligible: false as const, exclusionReason: "cross-owner" as const };
+    if (left.kinds.length !== 1 || right.kinds.length !== 1
+      || left.kinds[0] !== right.kinds[0] || !compatibleKinds.has(left.kinds[0])) {
+      return { eligible: false as const, exclusionReason: "incompatible-kind" as const };
+    }
+    if (left.critical || right.critical || semanticOwnership.ownerMasks[left.ownerIds[0]]?.priority === "critical") {
+      return { eligible: false as const, exclusionReason: "critical-ownership" as const };
+    }
+    return { eligible: true as const, ownerId: left.ownerIds[0], kind: left.kinds[0] as SourceEdgeAuditKind };
+  };
+
+  const edges: SourceEdgeAuditEdge[] = graph.edges.map((graphEdge) => {
+    const key = `${graphEdge.regionA}:${graphEdge.regionB}`;
+    const samples = edgeGradients.get(key);
+    if (!samples || samples.length !== graphEdge.sharedBoundaryPx) {
+      throw new Error(`Source boundary sampling diverged at region edge ${key}`);
+    }
+    const semantic = mode === "semantic"
+      ? classifySemanticEdge(graphEdge.regionA, graphEdge.regionB)
+      : { eligible: false as const };
+    const nodeA = graph.nodes[graphEdge.regionA];
+    const nodeB = graph.nodes[graphEdge.regionB];
+    const endpointReadiness: SourceEdgeEndpointReadiness = !nodeA.fits5Pt && !nodeB.fits5Pt
+      ? "FAIL-FAIL"
+      : nodeA.fits5Pt && nodeB.fits5Pt ? "PASS-PASS" : "FAIL-PASS";
+    return {
+      regionA: graphEdge.regionA,
+      regionB: graphEdge.regionB,
+      sharedBoundaryPx: graphEdge.sharedBoundaryPx,
+      sharedBoundaryMm: graphEdge.sharedBoundaryMm,
+      approvedPaletteLabDelta: graphEdge.labDistance,
+      sourceGradient: sourceEdgeDistribution(samples),
+      ...semantic,
+      endpointReadiness: semantic.eligible ? endpointReadiness : undefined,
+    };
+  });
+  const boundarySamplingMs = performance.now() - boundarySamplingStartedAt;
+  const eligibleEdges = edges.filter((edge) => edge.eligible);
+  const edgeClass = (readiness: SourceEdgeEndpointReadiness): SourceEdgeClassSummary => {
+    const selected = eligibleEdges.filter((edge) => edge.endpointReadiness === readiness);
+    const weakEdges = Object.fromEntries(SOURCE_EDGE_AUDIT_THRESHOLDS.map((threshold) => {
+      const count = selected.filter((edge) => edge.sourceGradient.p90 <= threshold).length;
+      return [threshold, { count, rate: selected.length ? count / selected.length * 100 : 0 }];
+    })) as Record<SourceEdgeAuditThreshold, SourceEdgeWeakRate>;
+    return {
+      edgeCount: selected.length,
+      sourceP90: sourceEdgeDistribution(selected.map((edge) => edge.sourceGradient.p90)),
+      approvedPaletteLabDelta: sourceEdgeDistribution(selected.map((edge) => edge.approvedPaletteLabDelta)),
+      weakEdges,
+    };
+  };
+  const edgeClasses: Record<SourceEdgeEndpointReadiness, SourceEdgeClassSummary> = {
+    "FAIL-FAIL": edgeClass("FAIL-FAIL"),
+    "FAIL-PASS": edgeClass("FAIL-PASS"),
+    "PASS-PASS": edgeClass("PASS-PASS"),
+  };
+
+  const failedNodes = graph.nodes.filter((node) => !node.fits5Pt);
+  const failedAreaPixels = failedNodes.reduce((sum, node) => sum + node.pixelArea, 0);
+  const semanticFailCount = semanticOwnership
+    ? failedNodes.filter((node) => semanticOwnership.regions[node.regionId].ownerIds.length > 0).length
+    : 0;
+  const regionIsEligible = (regionId: number) => {
+    if (!semanticOwnership) return false;
+    const region = semanticOwnership.regions[regionId];
+    return !region.ambiguous && !region.critical && region.ownerIds.length === 1 && region.kinds.length === 1
+      && compatibleKinds.has(region.kinds[0]) && semanticOwnership.ownerMasks[region.ownerIds[0]]?.priority !== "critical";
+  };
+  const eligibleSemanticFailCount = failedNodes.filter((node) => regionIsEligible(node.regionId)).length;
+  const baseline = {
+    currentRegions: graph.nodes.length,
+    failCount: failedNodes.length,
+    semanticFailCount,
+    eligibleSemanticFailCount,
+    fitCoverage: graph.nodes.length ? (graph.nodes.length - failedNodes.length) / graph.nodes.length * 100 : 100,
+    failedAreaPixels,
+    failedAreaMm2: failedAreaPixels * ARTWORK_WIDTH_MM * ARTWORK_HEIGHT_MM / labels.length,
+    failedAreaPercent: labels.length ? failedAreaPixels / labels.length * 100 : 0,
+  };
+
+  const goldenWeakBoundaryRate = mode === "golden"
+    ? Object.fromEntries(SOURCE_EDGE_AUDIT_THRESHOLDS.map((threshold) => {
+      const count = edges.filter((edge) => edge.sourceGradient.p90 <= threshold).length;
+      return [threshold, { count, rate: edges.length ? count / edges.length * 100 : 0 }];
+    })) as Record<SourceEdgeAuditThreshold, SourceEdgeWeakRate>
+    : undefined;
+
+  let graphClusteringMs = 0;
+  let union5PtChecksMs = 0;
+  let oracleByThreshold: Record<SourceEdgeAuditThreshold, SourceEdgeOracleThresholdResult> | undefined;
+  if (mode === "semantic") {
+    const thresholdResults = SOURCE_EDGE_AUDIT_THRESHOLDS.map((threshold): [SourceEdgeAuditThreshold, SourceEdgeOracleThresholdResult] => {
+      const clusteringStartedAt = performance.now();
+      const parent = Int32Array.from({ length: components.length }, (_, index) => index);
+      const rank = new Uint8Array(components.length);
+      const find = (value: number) => {
+        let root = value;
+        while (parent[root] !== root) root = parent[root];
+        while (parent[value] !== value) { const next = parent[value]; parent[value] = root; value = next; }
+        return root;
+      };
+      const union = (left: number, right: number) => {
+        let rootLeft = find(left);
+        let rootRight = find(right);
+        if (rootLeft === rootRight) return;
+        if (rank[rootLeft] < rank[rootRight]) [rootLeft, rootRight] = [rootRight, rootLeft];
+        parent[rootRight] = rootLeft;
+        if (rank[rootLeft] === rank[rootRight]) rank[rootLeft]++;
+      };
+      const weak = eligibleEdges.filter((edge) => edge.sourceGradient.p90 <= threshold);
+      const activeRegionIds = new Set<number>();
+      for (const edge of weak) {
+        union(edge.regionA, edge.regionB);
+        activeRegionIds.add(edge.regionA);
+        activeRegionIds.add(edge.regionB);
+      }
+      const grouped = new Map<number, number[]>();
+      for (const regionId of [...activeRegionIds].sort((left, right) => left - right)) {
+        const root = find(regionId);
+        const group = grouped.get(root);
+        if (group) group.push(regionId);
+        else grouped.set(root, [regionId]);
+      }
+      const groups = [...grouped.values()].filter((group) => group.length > 1)
+        .sort((left, right) => left[0] - right[0]);
+      graphClusteringMs += performance.now() - clusteringStartedAt;
+
+      const ownerBreakdown = emptySourceEdgeOwnerBreakdown();
+      const clusters: SourceEdgeOracleCluster[] = [];
+      let oraclePlaneClusters = 0;
+      let oracleResolvableFail = 0;
+      let theoreticalRegionReduction = 0;
+      let passRegionsConsumed = 0;
+      let passRegionsConsumedForFailGain = 0;
+      for (const regionIds of groups) {
+        const unionStartedAt = performance.now();
+        const firstOwnership = semanticOwnership!.regions[regionIds[0]];
+        const ownerId = firstOwnership.ownerIds[0];
+        const kind = firstOwnership.kinds[0] as SourceEdgeAuditKind;
+        const pixelCount = regionIds.reduce((sum, regionId) => sum + components[regionId].pixels.length, 0);
+        const pixels = new Array<number>(pixelCount);
+        let cursor = 0;
+        let minX = width;
+        let maxX = 0;
+        let minY = height;
+        let maxY = 0;
+        for (const regionId of regionIds) {
+          const component = components[regionId];
+          minX = Math.min(minX, component.minX); maxX = Math.max(maxX, component.maxX);
+          minY = Math.min(minY, component.minY); maxY = Math.max(maxY, component.maxY);
+          for (const pixel of component.pixels) pixels[cursor++] = pixel;
+        }
+        const unionComponent: Component = {
+          // W1 is an optimistic geometry upper bound and selects no colour.
+          // One digit exercises the accepted placement geometry without
+          // pretending that a production-paint number has been chosen.
+          label: 0,
+          pixels,
+          boundary: new Uint32Array(paints.length),
+          minX,
+          maxX,
+          minY,
+          maxY,
+        };
+        const fits5Pt = Boolean(findNumberPlacement(
+          unionComponent,
+          width,
+          0,
+          componentDistance(unionComponent, width),
+          componentMask(unionComponent, width),
+          componentOrientation(unionComponent, width),
+          printScale(width, height),
+        ));
+        union5PtChecksMs += performance.now() - unionStartedAt;
+        const failCount = regionIds.filter((regionId) => !graph.nodes[regionId].fits5Pt).length;
+        const passCount = regionIds.length - failCount;
+        const cluster: SourceEdgeOracleCluster = {
+          firstRegionId: regionIds[0],
+          ownerId,
+          kind,
+          originalRegionCount: regionIds.length,
+          failCount,
+          passCount,
+          areaMm2: pixels.length * ARTWORK_WIDTH_MM * ARTWORK_HEIGHT_MM / labels.length,
+          fits5Pt,
+        };
+        clusters.push(cluster);
+        ownerBreakdown[kind].connectedClusters++;
+        if (!fits5Pt) continue;
+        oraclePlaneClusters++;
+        oracleResolvableFail += failCount;
+        theoreticalRegionReduction += regionIds.length - 1;
+        passRegionsConsumed += passCount;
+        if (failCount) passRegionsConsumedForFailGain += passCount;
+        ownerBreakdown[kind].oraclePlaneClusters++;
+        ownerBreakdown[kind].oracleResolvableFail += failCount;
+        ownerBreakdown[kind].theoreticalRegionReduction += regionIds.length - 1;
+        ownerBreakdown[kind].passRegionsConsumed += passCount;
+        if (failCount) ownerBreakdown[kind].passRegionsConsumedForFailGain += passCount;
+      }
+      clusters.sort((left, right) => right.areaMm2 - left.areaMm2
+        || right.originalRegionCount - left.originalRegionCount || left.firstRegionId - right.firstRegionId);
+      return [threshold, {
+        threshold,
+        weakEligibleEdges: weak.length,
+        weakEligibleEdgeRate: eligibleEdges.length ? weak.length / eligibleEdges.length * 100 : 0,
+        connectedClusters: groups.length,
+        oraclePlaneClusters,
+        oracleResolvableFail,
+        oracleResolvableFailPercent: semanticFailCount ? oracleResolvableFail / semanticFailCount * 100 : 0,
+        theoreticalRegionReduction,
+        theoreticalRegionReductionPercent: graph.nodes.length ? theoreticalRegionReduction / graph.nodes.length * 100 : 0,
+        passRegionsConsumed,
+        passRegionsConsumedForFailGain,
+        ownerBreakdown,
+        largestClusters: clusters.slice(0, 10),
+      }];
+    });
+    oracleByThreshold = Object.fromEntries(thresholdResults) as Record<SourceEdgeAuditThreshold, SourceEdgeOracleThresholdResult>;
+  }
+
+  const decodedSourceUnchanged = decodedPixelCheckpoint
+    === sourceEdgePixelCheckpoint("SRC", sourcePixels, sourceWidth, sourceHeight, sourceChannels);
+  const labelMapUnchanged = inputLabelCheckpoint === sourceEdgePixelCheckpoint("LBL", sourceLabels, width, height, 1);
+  if (!decodedSourceUnchanged || !labelMapUnchanged) throw new Error("W1 mutated an immutable input");
+
+  let auditHash = 0x811c9dc5;
+  const updateHash = (value: number) => {
+    auditHash ^= value & 255;
+    auditHash = Math.imul(auditHash, 0x01000193);
+  };
+  const updateHashNumber = (value: number) => {
+    const normalized = Math.round(value * 1_000_000);
+    updateHash(normalized); updateHash(normalized >>> 8); updateHash(normalized >>> 16); updateHash(normalized >>> 24);
+  };
+  for (const character of `${mode}:${decodedPixelCheckpoint}:${normalizedPixelCheckpoint}:${inputLabelCheckpoint}`) updateHash(character.charCodeAt(0));
+  for (const edge of edges) {
+    updateHashNumber(edge.regionA); updateHashNumber(edge.regionB); updateHashNumber(edge.sharedBoundaryPx);
+    updateHashNumber(edge.sourceGradient.mean); updateHashNumber(edge.sourceGradient.p50); updateHashNumber(edge.sourceGradient.p90); updateHashNumber(edge.sourceGradient.max);
+    updateHash(edge.eligible ? 1 : 0);
+    for (const character of edge.endpointReadiness ?? edge.exclusionReason ?? "golden") updateHash(character.charCodeAt(0));
+  }
+  if (oracleByThreshold) for (const threshold of SOURCE_EDGE_AUDIT_THRESHOLDS) {
+    const oracle = oracleByThreshold[threshold];
+    updateHashNumber(oracle.weakEligibleEdges); updateHashNumber(oracle.connectedClusters); updateHashNumber(oracle.oraclePlaneClusters);
+    updateHashNumber(oracle.oracleResolvableFail); updateHashNumber(oracle.theoreticalRegionReduction); updateHashNumber(oracle.passRegionsConsumed);
+    for (const cluster of oracle.largestClusters) {
+      updateHashNumber(cluster.firstRegionId); updateHashNumber(cluster.originalRegionCount); updateHashNumber(cluster.failCount);
+      updateHashNumber(cluster.passCount); updateHashNumber(cluster.areaMm2); updateHash(cluster.fits5Pt ? 1 : 0);
+    }
+  }
+  const runtime: SourceEdgeAuditRuntime = {
+    decodeMs,
+    sourceNormalizationMs,
+    decodeNormalizationMs: decodeMs + sourceNormalizationMs,
+    baselineGraphMs,
+    boundarySamplingMs,
+    graphClusteringMs,
+    union5PtChecksMs,
+    totalMs: decodeMs + performance.now() - startedAt,
+  };
+  return {
+    mode,
+    width,
+    height,
+    source: {
+      width: sourceWidth,
+      height: sourceHeight,
+      channels: sourceChannels,
+      aspectMismatchPercent,
+      decodedPixelCheckpoint,
+      normalizedPixelCheckpoint,
+    },
+    baseline,
+    internalBoundaryEdges: edges.length,
+    allBoundarySourceP90: sourceEdgeDistribution(edges.map((edge) => edge.sourceGradient.p90)),
+    eligibleSemanticAdjacencyCount: eligibleEdges.length,
+    edgeClasses,
+    goldenWeakBoundaryRate,
+    oracleByThreshold,
+    edges,
+    runtime,
+    decodedSourceUnchanged,
+    labelMapUnchanged,
+    auditCheckpoint: `W1-${(auditHash >>> 0).toString(16).padStart(8, "0").toUpperCase()}`,
   };
 }
 

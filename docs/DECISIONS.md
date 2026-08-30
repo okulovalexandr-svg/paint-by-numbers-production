@@ -68,5 +68,8 @@ Semantic microregions may be simplified only on a private post-S1/R2 clone and o
 ## D-022 — Phase V1 semantic planes remain a validator-gated dry-run
 V1 may move weak internal semantic boundaries only inside one exact S1 `face`, `hand` or `key-detail` owner on a private post-B+C clone. Seeds use the existing exact 5 pt fit plus distance-transform anchors; deterministic pixel growth selects only existing production-paint medoids. Critical, ambiguous, silhouette and strong-edge barriers are immutable, each owner is independently rollbackable, and V1 has no production/UI/Final Region Map/numbering/contour/SVG/PDF call site.
 
+## D-023 — Phase W1 is a source-edge geometry audit only
+W1 may measure deterministic original-source Lab gradients across immutable accepted palette-region boundaries and may test temporary same-owner weak-edge unions with the existing 5 pt placement geometry. It cannot choose colours, recolor/relabel pixels, contract NEW174, emit a candidate preview or feed production/UI/Final Region Map/numbering/contour/SVG/PDF. Source/label inputs and accepted S1 ownership remain immutable; thresholds 4/8/12 are diagnostic probes only.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
