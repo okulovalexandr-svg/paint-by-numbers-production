@@ -302,6 +302,79 @@ export type RegionOptimizerSimulationResult = {
   simulatedLabels: Uint8Array;
 };
 
+export type SemanticSimplifierProfile = "conservative" | "balanced" | "exploratory";
+
+export type SemanticSimplifierSnapshot = RegionOptimizerReadinessSnapshot & {
+  semanticFailCount: number;
+  nonSemanticFailCount: number;
+};
+
+export type SemanticSimplifierLabDelta = {
+  mean: number;
+  median: number;
+  p90: number;
+  max: number;
+};
+
+export type SemanticSimplifierKindBreakdown = {
+  operations: number;
+  failResolved: number;
+  changedPixels: number;
+  changedAreaPercent: number;
+  unresolvedFail: number;
+};
+
+export type SemanticSimplifierTrajectoryPoint = SemanticSimplifierSnapshot & {
+  pass: number;
+  acceptedOperations: number;
+};
+
+export type SemanticSimplifierSimulationOptions = {
+  profile?: SemanticSimplifierProfile;
+  maxAcceptedOperations?: number;
+  maxPasses?: number;
+  postBCBaseline?: Pick<SemanticSimplifierSnapshot, "regions" | "failCount">;
+  includeTrajectory?: boolean;
+};
+
+export type SemanticSimplifierSimulationResult = {
+  width: number;
+  height: number;
+  profile: SemanticSimplifierProfile;
+  maxCandidateLabDelta: number;
+  start: SemanticSimplifierSnapshot;
+  end: SemanticSimplifierSnapshot;
+  acceptedSemanticOperations: number;
+  rejectedOperationsByReason: Record<string, number>;
+  regionReductionPercentFromS1R2: number;
+  failReductionPercentFromS1R2: number;
+  semanticFailReductionPercentFromS1R2: number;
+  totalRegionReductionPercentFromPostBC: number;
+  totalFailReductionPercentFromPostBC: number;
+  rasterAreaChangedPercent: number;
+  semanticAreaChangedPercent: number;
+  changedPixelLabDelta: SemanticSimplifierLabDelta;
+  strongInternalBoundariesRemoved: number;
+  strongInternalBoundaryLengthPxRemoved: number;
+  strongInternalBoundaryLengthMmRemoved: number;
+  ownerSilhouettePixelsChanged: number;
+  ownerSilhouetteBoundaryEdgesChanged: number;
+  criticalPixelsChanged: number;
+  newFailuresCreated: number;
+  colorsBefore: number;
+  colorsAfter: number;
+  eliminatedColorCodes: string[];
+  ownerKinds: Record<"face" | "hand" | "key-detail", SemanticSimplifierKindBreakdown>;
+  passes: number;
+  stopReason: "no-improving-safe-operation" | "max-passes" | "max-accepted-operations";
+  capHit: boolean;
+  finalRasterCheckpoint: string;
+  finalGraphCheckpoint: string;
+  trajectory?: SemanticSimplifierTrajectoryPoint[];
+  finalGraph: RegionGraphDiagnosticResult;
+  simulatedLabels: Uint8Array;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -3424,6 +3497,402 @@ export async function simulateIterativeRegionOptimizer(
     labels[pixel] = approved.assignment.get(key) ?? 0;
   }
   return simulateIterativeRegionOptimizerFromLabelMap(labels, width, height, approved.selectedPaints, semanticRegions, options);
+}
+
+type SemanticSimplifierComponentIdentity = {
+  ownerId: number | null;
+  kind: SemanticRegionKind | null;
+  exactSingleOwner: boolean;
+  touchesCritical: boolean;
+  touchesOwnerSilhouette: boolean;
+};
+
+const SEMANTIC_SIMPLIFIER_PROFILE_LIMITS: Record<SemanticSimplifierProfile, number> = {
+  conservative: 8,
+  balanced: 12,
+  exploratory: 16,
+};
+
+function semanticSimplifierSnapshot(graph: RegionGraphDiagnosticResult): SemanticSimplifierSnapshot {
+  const readiness = regionOptimizerSnapshot(graph);
+  return {
+    ...readiness,
+    semanticFailCount: graph.summary.semanticFailedNodes,
+    nonSemanticFailCount: graph.summary.nonSemanticFailedNodes,
+  };
+}
+
+/**
+ * Phase S2 diagnostic only. It simplifies semantic microgeometry on a private
+ * label-map clone and is deliberately not connected to production processing,
+ * approval, numbering, contours, SVG or PDF.
+ */
+export async function simulateSemanticObjectSimplifierFromLabelMap(
+  sourceLabels: Uint8Array,
+  width: number,
+  height: number,
+  paints: ProductionPaint[],
+  semanticRegions: SemanticRegion[],
+  semanticOwnership: RegionAlignedSemanticOwnershipResult,
+  options: SemanticSimplifierSimulationOptions = {},
+): Promise<SemanticSimplifierSimulationResult> {
+  if (width < 1 || height < 1 || sourceLabels.length !== width * height) throw new Error("Invalid semantic-simplifier label map dimensions");
+  if (!paints.length) throw new Error("Production palette is empty");
+  if (semanticOwnership.width !== width || semanticOwnership.height !== height
+    || semanticOwnership.semanticMask.length !== sourceLabels.length
+    || semanticOwnership.criticalMask.length !== sourceLabels.length) {
+    throw new Error("Semantic ownership dimensions do not match semantic-simplifier raster");
+  }
+  for (const owner of semanticOwnership.ownerMasks) {
+    if (owner.mask.length !== sourceLabels.length) throw new Error("Semantic owner mask dimensions do not match semantic-simplifier raster");
+  }
+
+  const profile = options.profile ?? "balanced";
+  const maxCandidateLabDelta = SEMANTIC_SIMPLIFIER_PROFILE_LIMITS[profile];
+  const maxPasses = Math.max(1, Math.min(20, options.maxPasses ?? 20));
+  const originalLabels = sourceLabels.slice();
+  let labels = sourceLabels.slice();
+  const labs = paints.map((paint) => rgbToLab(...hexToRgb(paint.hex)));
+  const pixelOwner = new Int32Array(labels.length);
+  pixelOwner.fill(-1);
+  for (const owner of semanticOwnership.ownerMasks) {
+    for (let pixel = 0; pixel < owner.mask.length; pixel++) {
+      if (!owner.mask[pixel]) continue;
+      if (pixelOwner[pixel] === -1) pixelOwner[pixel] = owner.ownerId;
+      else if (pixelOwner[pixel] !== owner.ownerId) pixelOwner[pixel] = -2;
+    }
+  }
+  const ownerKind = new Map(semanticOwnership.ownerMasks.map((owner) => [owner.ownerId, owner.kind]));
+  const eligibleKinds = new Set<SemanticRegionKind>(["face", "hand", "key-detail"]);
+  const kindPixels: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+  for (let pixel = 0; pixel < pixelOwner.length; pixel++) {
+    const kind = ownerKind.get(pixelOwner[pixel]);
+    if (kind && eligibleKinds.has(kind)) kindPixels[kind as keyof typeof kindPixels]++;
+  }
+
+  const ownerBoundaryPixels = new Uint8Array(labels.length);
+  const ownerBoundaryEdges: Array<[number, number]> = [];
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x;
+    const ownerId = pixelOwner[pixel];
+    if (ownerId >= 0 && (x === 0 || x === width - 1 || y === 0 || y === height - 1)) ownerBoundaryPixels[pixel] = 1;
+    if (x + 1 < width && pixelOwner[pixel + 1] !== ownerId && (ownerId >= 0 || pixelOwner[pixel + 1] >= 0)) {
+      if (ownerId >= 0) ownerBoundaryPixels[pixel] = 1;
+      if (pixelOwner[pixel + 1] >= 0) ownerBoundaryPixels[pixel + 1] = 1;
+      ownerBoundaryEdges.push([pixel, pixel + 1]);
+    }
+    if (y + 1 < height && pixelOwner[pixel + width] !== ownerId && (ownerId >= 0 || pixelOwner[pixel + width] >= 0)) {
+      if (ownerId >= 0) ownerBoundaryPixels[pixel] = 1;
+      if (pixelOwner[pixel + width] >= 0) ownerBoundaryPixels[pixel + width] = 1;
+      ownerBoundaryEdges.push([pixel, pixel + width]);
+    }
+  }
+
+  const initialGraph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints, semanticRegions, semanticOwnership);
+  let graph = initialGraph;
+  const start = semanticSimplifierSnapshot(initialGraph);
+  const maxAcceptedOperations = Math.max(1, Math.min(5000, start.regions, options.maxAcceptedOperations ?? Math.min(5000, start.regions)));
+  const batchLimit = Math.max(1, Math.ceil(maxAcceptedOperations / maxPasses));
+  const initialColorCounts = new Uint32Array(paints.length);
+  for (const label of labels) initialColorCounts[label]++;
+  const rejectedOperationsByReason: Record<string, number> = {};
+  const reject = (reason: string, count = 1) => { rejectedOperationsByReason[reason] = (rejectedOperationsByReason[reason] || 0) + count; };
+  const operationCounts: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+  const resolvedCounts: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+  let acceptedSemanticOperations = 0;
+  let passes = 0;
+  let newFailuresCreated = 0;
+  let stopReason: SemanticSimplifierSimulationResult["stopReason"] = "no-improving-safe-operation";
+  const trajectory: SemanticSimplifierTrajectoryPoint[] = [{ pass: 0, acceptedOperations: 0, ...start }];
+
+  const collectComponents = async (currentLabels: Uint8Array) => {
+    const components: Component[] = [];
+    const componentMap = new Int32Array(currentLabels.length);
+    componentMap.fill(-1);
+    await walkComponents(currentLabels, width, height, paints.length, (component) => {
+      const id = components.length;
+      components.push(component);
+      for (const pixel of component.pixels) componentMap[pixel] = id;
+    }, async () => undefined);
+    return { components, componentMap };
+  };
+
+  const componentIdentities = (components: Component[]): SemanticSimplifierComponentIdentity[] => components.map((component) => {
+    let exactOwner: number | null = null;
+    let exactSingleOwner = true;
+    let touchesCritical = false;
+    let touchesOwnerSilhouette = false;
+    for (const pixel of component.pixels) {
+      const currentOwner = pixelOwner[pixel];
+      if (currentOwner < 0) exactSingleOwner = false;
+      else if (exactOwner === null) exactOwner = currentOwner;
+      else if (currentOwner !== exactOwner) exactSingleOwner = false;
+      if (semanticOwnership.criticalMask[pixel]) touchesCritical = true;
+      if (ownerBoundaryPixels[pixel]) touchesOwnerSilhouette = true;
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      for (const [dx, dy] of NEIGHBORS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height && semanticOwnership.criticalMask[ny * width + nx]) touchesCritical = true;
+      }
+    }
+    const kind = exactSingleOwner && exactOwner !== null ? ownerKind.get(exactOwner) ?? null : null;
+    return { ownerId: exactSingleOwner ? exactOwner : null, kind, exactSingleOwner, touchesCritical, touchesOwnerSilhouette };
+  });
+
+  while (passes < maxPasses && acceptedSemanticOperations < maxAcceptedOperations) {
+    const { components } = await collectComponents(labels);
+    const identities = componentIdentities(components);
+    const componentCountsByLabel = new Uint32Array(paints.length);
+    for (const component of components) componentCountsByLabel[component.label]++;
+    const internalDistances = new Map<number, number[]>();
+    for (const edge of graph.edges) {
+      const left = identities[edge.regionA];
+      const right = identities[edge.regionB];
+      if (!left.exactSingleOwner || !right.exactSingleOwner || left.ownerId === null || left.ownerId !== right.ownerId || left.kind !== right.kind) continue;
+      const values = internalDistances.get(left.ownerId) || [];
+      values.push(edge.labDistance);
+      internalDistances.set(left.ownerId, values);
+    }
+    const strongThresholds = new Map<number, number>();
+    for (const [ownerId, values] of internalDistances) {
+      values.sort((left, right) => left - right);
+      const p90 = values.length ? values[Math.max(0, Math.ceil(values.length * 0.9) - 1)] : 0;
+      strongThresholds.set(ownerId, Math.max(12, p90));
+    }
+    const strongEdges = new Set<string>();
+    for (const edge of graph.edges) {
+      const identity = identities[edge.regionA];
+      if (!identity.exactSingleOwner || identity.ownerId === null || identity.ownerId !== identities[edge.regionB].ownerId) continue;
+      if (edge.labDistance + 1e-9 >= (strongThresholds.get(identity.ownerId) ?? 12)) strongEdges.add(`${edge.regionA}:${edge.regionB}`);
+    }
+    const strongIncident = components.map(() => false);
+    for (const edge of graph.edges) if (strongEdges.has(`${edge.regionA}:${edge.regionB}`)) {
+      strongIncident[edge.regionA] = true;
+      strongIncident[edge.regionB] = true;
+    }
+    const holeCache = new Map<number, boolean>();
+    type Candidate = { donorId: number; targetId: number; edge: RegionGraphEdge; ownerId: number; kind: "face" | "hand" | "key-detail" };
+    const candidates: Candidate[] = [];
+    for (const edge of graph.edges) {
+      const leftNode = graph.nodes[edge.regionA];
+      const rightNode = graph.nodes[edge.regionB];
+      let donorId: number;
+      let targetId: number;
+      if (!leftNode.fits5Pt && rightNode.fits5Pt) { donorId = edge.regionA; targetId = edge.regionB; }
+      else if (leftNode.fits5Pt && !rightNode.fits5Pt) { donorId = edge.regionB; targetId = edge.regionA; }
+      else continue;
+      const donor = components[donorId];
+      const target = components[targetId];
+      const targetNode = graph.nodes[targetId];
+      const donorIdentity = identities[donorId];
+      const targetIdentity = identities[targetId];
+      if (!donorIdentity.exactSingleOwner || !targetIdentity.exactSingleOwner) { reject("ambiguous-owner"); continue; }
+      if (donorIdentity.ownerId === null || donorIdentity.ownerId !== targetIdentity.ownerId || donorIdentity.kind !== targetIdentity.kind) {
+        reject("different-owner-or-kind"); continue;
+      }
+      if (!donorIdentity.kind || !eligibleKinds.has(donorIdentity.kind)) { reject("different-owner-or-kind"); continue; }
+      if (donorIdentity.touchesCritical) { reject("touches-critical-boundary"); continue; }
+      if (donorIdentity.touchesOwnerSilhouette) { reject("owner-silhouette-boundary"); continue; }
+      if (strongIncident[donorId]) { reject("strong-internal-boundary"); continue; }
+      if (edge.labDistance > maxCandidateLabDelta + 1e-9) { reject("profile-lab-limit"); continue; }
+      if (!targetNode.fits5Pt || target.pixels.length < donor.pixels.length || edge.sharedBoundaryPx < 2) { reject("unstable-small-anchor"); continue; }
+      if (componentCountsByLabel[donor.label] <= 1) { reject("would-eliminate-production-color"); continue; }
+      const sameTargetColorNeighbors = graph.nodes[donorId].neighboringRegionIds.filter((neighborId) => components[neighborId].label === target.label);
+      if (sameTargetColorNeighbors.length !== 1 || sameTargetColorNeighbors[0] !== targetId) { reject("would-create-target-bridge"); continue; }
+      const hasHole = holeCache.get(donorId) ?? componentContainsHole(donor, width);
+      holeCache.set(donorId, hasHole);
+      if (hasHole) { reject("would-eliminate-hole-boundary"); continue; }
+      candidates.push({
+        donorId,
+        targetId,
+        edge,
+        ownerId: donorIdentity.ownerId,
+        kind: donorIdentity.kind as "face" | "hand" | "key-detail",
+      });
+    }
+
+    // Choose the best anchor for each failed microregion first: longest shared
+    // boundary, then the smallest Lab distance, then stable numeric IDs.
+    candidates.sort((left, right) => left.donorId - right.donorId
+      || right.edge.sharedBoundaryPx - left.edge.sharedBoundaryPx
+      || left.edge.labDistance - right.edge.labDistance
+      || left.targetId - right.targetId);
+    const bestCandidates: Candidate[] = [];
+    const donorsSeen = new Set<number>();
+    for (const candidate of candidates) if (!donorsSeen.has(candidate.donorId)) {
+      donorsSeen.add(candidate.donorId);
+      bestCandidates.push(candidate);
+    }
+    bestCandidates.sort((left, right) => components[left.donorId].pixelArea - components[right.donorId].pixelArea
+      || right.edge.sharedBoundaryPx - left.edge.sharedBoundaryPx
+      || left.edge.labDistance - right.edge.labDistance
+      || left.donorId - right.donorId
+      || left.targetId - right.targetId);
+    const usedComponents = new Set<number>();
+    const usedTargetLabels = new Set<number>();
+    const batch: Candidate[] = [];
+    const remaining = maxAcceptedOperations - acceptedSemanticOperations;
+    for (const candidate of bestCandidates) {
+      if (batch.length >= Math.min(batchLimit, remaining)) break;
+      if (usedComponents.has(candidate.donorId) || usedComponents.has(candidate.targetId)) continue;
+      const targetLabel = components[candidate.targetId].label;
+      if (usedTargetLabels.has(targetLabel)) continue;
+      usedComponents.add(candidate.donorId);
+      usedComponents.add(candidate.targetId);
+      usedTargetLabels.add(targetLabel);
+      batch.push(candidate);
+    }
+    if (!batch.length) { stopReason = "no-improving-safe-operation"; break; }
+
+    const trialLabels = labels.slice();
+    for (const operation of batch) {
+      const targetLabel = components[operation.targetId].label;
+      for (const pixel of components[operation.donorId].pixels) trialLabels[pixel] = targetLabel;
+    }
+    const trialGraph = await buildRegionGraphDiagnosticFromLabelMap(trialLabels, width, height, paints, semanticRegions, semanticOwnership);
+    const currentSnapshot = semanticSimplifierSnapshot(graph);
+    const trialSnapshot = semanticSimplifierSnapshot(trialGraph);
+    const trialColorCounts = new Uint32Array(paints.length);
+    for (const label of trialLabels) trialColorCounts[label]++;
+    const eliminatedInTrial = paints.some((_, index) => initialColorCounts[index] > 0 && trialColorCounts[index] === 0);
+    let trialCriticalChanges = 0;
+    let trialSilhouettePixelChanges = 0;
+    for (let pixel = 0; pixel < labels.length; pixel++) {
+      if (trialLabels[pixel] === originalLabels[pixel]) continue;
+      if (semanticOwnership.criticalMask[pixel]) trialCriticalChanges++;
+      if (ownerBoundaryPixels[pixel]) trialSilhouettePixelChanges++;
+    }
+    const { componentMap: trialComponentMap } = await collectComponents(trialLabels);
+    let batchNewFailures = 0;
+    const newlyFailedIds = new Set<number>();
+    for (let regionId = 0; regionId < graph.nodes.length; regionId++) {
+      if (!graph.nodes[regionId].fits5Pt) continue;
+      const trialRegionId = trialComponentMap[components[regionId].pixels[0]];
+      if (!trialGraph.nodes[trialRegionId]?.fits5Pt) newlyFailedIds.add(trialRegionId);
+    }
+    batchNewFailures = newlyFailedIds.size;
+    const objectiveAccepted = trialSnapshot.regions === currentSnapshot.regions - batch.length
+      && trialSnapshot.failCount === currentSnapshot.failCount - batch.length
+      && trialSnapshot.fitCoverage + 1e-9 >= currentSnapshot.fitCoverage
+      && trialSnapshot.failedAreaPercent <= currentSnapshot.failedAreaPercent + 1e-9
+      && batchNewFailures === 0
+      && trialCriticalChanges === 0
+      && trialSilhouettePixelChanges === 0
+      && !eliminatedInTrial;
+    if (!objectiveAccepted) {
+      if (eliminatedInTrial) reject("rollback-eliminated-production-color", batch.length);
+      else if (trialCriticalChanges) reject("rollback-critical-pixel-change", batch.length);
+      else if (trialSilhouettePixelChanges) reject("rollback-owner-silhouette-change", batch.length);
+      else if (batchNewFailures) reject("rollback-new-failure", batch.length);
+      else reject("rollback-objective-regression", batch.length);
+      stopReason = "no-improving-safe-operation";
+      break;
+    }
+
+    labels = trialLabels;
+    graph = trialGraph;
+    acceptedSemanticOperations += batch.length;
+    newFailuresCreated += batchNewFailures;
+    for (const operation of batch) {
+      operationCounts[operation.kind]++;
+      resolvedCounts[operation.kind]++;
+    }
+    passes++;
+    trajectory.push({ pass: passes, acceptedOperations: acceptedSemanticOperations, ...trialSnapshot });
+  }
+  if (acceptedSemanticOperations >= maxAcceptedOperations) stopReason = "max-accepted-operations";
+  else if (passes >= maxPasses) stopReason = "max-passes";
+
+  const end = semanticSimplifierSnapshot(graph);
+  const finalColorCounts = new Uint32Array(paints.length);
+  for (const label of labels) finalColorCounts[label]++;
+  const eliminatedColorCodes = paints
+    .filter((_, index) => initialColorCounts[index] > 0 && finalColorCounts[index] === 0)
+    .map((paint) => paint.code);
+  const changedLab: number[] = [];
+  const changedKindPixels: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+  let changedPixels = 0;
+  let changedSemanticPixels = 0;
+  let criticalPixelsChanged = 0;
+  let ownerSilhouettePixelsChanged = 0;
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    if (labels[pixel] === originalLabels[pixel]) continue;
+    changedPixels++;
+    if (semanticOwnership.semanticMask[pixel]) changedSemanticPixels++;
+    if (semanticOwnership.criticalMask[pixel]) criticalPixelsChanged++;
+    if (ownerBoundaryPixels[pixel]) ownerSilhouettePixelsChanged++;
+    const kind = ownerKind.get(pixelOwner[pixel]);
+    if (kind && eligibleKinds.has(kind)) changedKindPixels[kind as keyof typeof changedKindPixels]++;
+    changedLab.push(Math.sqrt(labDistance(labs[originalLabels[pixel]], labs[labels[pixel]])));
+  }
+  changedLab.sort((left, right) => left - right);
+  const percentile = (ratio: number) => changedLab.length ? changedLab[Math.max(0, Math.ceil(changedLab.length * ratio) - 1)] : 0;
+  const changedPixelLabDelta: SemanticSimplifierLabDelta = {
+    mean: changedLab.length ? changedLab.reduce((sum, value) => sum + value, 0) / changedLab.length : 0,
+    median: percentile(0.5),
+    p90: percentile(0.9),
+    max: changedLab[changedLab.length - 1] ?? 0,
+  };
+  let ownerSilhouetteBoundaryEdgesChanged = 0;
+  for (const [left, right] of ownerBoundaryEdges) {
+    if (labels[left] !== originalLabels[left] || labels[right] !== originalLabels[right]) ownerSilhouetteBoundaryEdgesChanged++;
+  }
+  const { components: finalComponents } = await collectComponents(labels);
+  const finalIdentities = componentIdentities(finalComponents);
+  const unresolved: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+  for (let regionId = 0; regionId < graph.nodes.length; regionId++) {
+    if (graph.nodes[regionId].fits5Pt) continue;
+    const identity = finalIdentities[regionId];
+    if (identity.exactSingleOwner && identity.kind && eligibleKinds.has(identity.kind)) unresolved[identity.kind as keyof typeof unresolved]++;
+  }
+  const ownerKinds = Object.fromEntries((["face", "hand", "key-detail"] as const).map((kind) => [kind, {
+    operations: operationCounts[kind],
+    failResolved: resolvedCounts[kind],
+    changedPixels: changedKindPixels[kind],
+    changedAreaPercent: kindPixels[kind] ? changedKindPixels[kind] / kindPixels[kind] * 100 : 0,
+    unresolvedFail: unresolved[kind],
+  }])) as Record<"face" | "hand" | "key-detail", SemanticSimplifierKindBreakdown>;
+  const postBC = options.postBCBaseline ?? start;
+  const semanticPixels = semanticOwnership.semanticMask.reduce((sum, value) => sum + value, 0);
+  return {
+    width,
+    height,
+    profile,
+    maxCandidateLabDelta,
+    start,
+    end,
+    acceptedSemanticOperations,
+    rejectedOperationsByReason,
+    regionReductionPercentFromS1R2: start.regions ? (start.regions - end.regions) / start.regions * 100 : 0,
+    failReductionPercentFromS1R2: start.failCount ? (start.failCount - end.failCount) / start.failCount * 100 : 0,
+    semanticFailReductionPercentFromS1R2: start.semanticFailCount ? (start.semanticFailCount - end.semanticFailCount) / start.semanticFailCount * 100 : 0,
+    totalRegionReductionPercentFromPostBC: postBC.regions ? (postBC.regions - end.regions) / postBC.regions * 100 : 0,
+    totalFailReductionPercentFromPostBC: postBC.failCount ? (postBC.failCount - end.failCount) / postBC.failCount * 100 : 0,
+    rasterAreaChangedPercent: labels.length ? changedPixels / labels.length * 100 : 0,
+    semanticAreaChangedPercent: semanticPixels ? changedSemanticPixels / semanticPixels * 100 : 0,
+    changedPixelLabDelta,
+    strongInternalBoundariesRemoved: 0,
+    strongInternalBoundaryLengthPxRemoved: 0,
+    strongInternalBoundaryLengthMmRemoved: 0,
+    ownerSilhouettePixelsChanged,
+    ownerSilhouetteBoundaryEdgesChanged,
+    criticalPixelsChanged,
+    newFailuresCreated,
+    colorsBefore: [...initialColorCounts].filter(Boolean).length,
+    colorsAfter: [...finalColorCounts].filter(Boolean).length,
+    eliminatedColorCodes,
+    ownerKinds,
+    passes,
+    stopReason,
+    capHit: stopReason !== "no-improving-safe-operation",
+    finalRasterCheckpoint: checkpointIdentity(labels, paints, width, height),
+    finalGraphCheckpoint: regionGraphCheckpoint(graph),
+    trajectory: options.includeTrajectory ? trajectory : undefined,
+    finalGraph: graph,
+    simulatedLabels: labels,
+  };
 }
 
 export async function createProductionFailureOverlay(

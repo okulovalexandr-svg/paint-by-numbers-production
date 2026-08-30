@@ -62,5 +62,8 @@ The iterative optimizer may recolor and contract regions only on a private clone
 ## D-020 — Phase S1 semantic masks follow existing region boundaries
 Semantic rectangles may be converted diagnostically into deterministic ownership masks only by selecting complete existing post-B+C 4-connected paint regions. Critical eye/text/logo cores remain fully protected, crossing background regions require materially stronger ownership evidence, and ambiguous same-priority ownership is preserved rather than guessed. S1 masks are optional simulator inputs only and do not change the semantic-analysis API, production raster, validator, Phase B/C, numbering, contours, SVG/PDF or immutable Final Region Map.
 
+## D-021 — Phase S2 semantic simplification remains a dry-run
+Semantic microregions may be simplified only on a private post-S1/R2 clone and only inside one exact `face`, `hand` or `key-detail` owner. Critical masks, ambiguous ownership, strong local internal edges and owner silhouettes are hard invariants, and every batch must be rolled back on readiness, topology, color or coverage regression. The 8/12/16 Lab profiles are diagnostic Pareto probes, not production thresholds; S2 does not feed production output, UI approval or the immutable Final Region Map.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
