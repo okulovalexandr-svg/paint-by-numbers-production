@@ -1481,6 +1481,51 @@ function findNumberPlacement(
   return null;
 }
 
+/** Diagnostic-only adapter for isolated geometry contracts such as X1A. */
+export function fitsExactFivePointPixelComponent(
+  sourcePixels: readonly number[],
+  width: number,
+  height: number,
+  label: number,
+) {
+  if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+    throw new Error("Invalid exact 5 pt component dimensions");
+  }
+  if (!Number.isInteger(label) || label < 0) throw new Error("Invalid exact 5 pt component label");
+  const pixels = [...new Set(sourcePixels)].sort((left, right) => left - right);
+  if (!pixels.length || pixels.some((pixel) => !Number.isInteger(pixel) || pixel < 0 || pixel >= width * height)) {
+    throw new Error("Invalid exact 5 pt component pixels");
+  }
+  let minX = width;
+  let maxX = 0;
+  let minY = height;
+  let maxY = 0;
+  for (const pixel of pixels) {
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  const component: Component = {
+    label,
+    pixels,
+    boundary: new Uint32Array(),
+    minX,
+    maxX,
+    minY,
+    maxY,
+  };
+  return Boolean(findNumberPlacement(
+    component,
+    width,
+    label,
+    componentDistance(component, width),
+    componentMask(component, width),
+    componentOrientation(component, width),
+    printScale(width, height),
+  ));
+}
+
 async function mergeUnnumberableAreas(
   labels: Uint8Array,
   width: number,

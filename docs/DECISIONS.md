@@ -71,5 +71,8 @@ V1 may move weak internal semantic boundaries only inside one exact S1 `face`, `
 ## D-023 — Phase W1 is a source-edge geometry audit only
 W1 may measure deterministic original-source Lab gradients across immutable accepted palette-region boundaries and may test temporary same-owner weak-edge unions with the existing 5 pt placement geometry. It cannot choose colours, recolor/relabel pixels, contract NEW174, emit a candidate preview or feed production/UI/Final Region Map/numbering/contour/SVG/PDF. Source/label inputs and accepted S1 ownership remain immutable; thresholds 4/8/12 are diagnostic probes only.
 
+## D-024 — X1A semantic planes are a strict isolated geometry contract
+X1A defines normalized polygon owners and internal paint planes with deterministic validation, raster precedence, ambiguity handling and exact 5 pt component preflight. It carries no production colour, never repairs invalid geometry, and has no AI/API/production/UI/approval/Final Region Map/numbering/contour/SVG/PDF call site. Cross-owner overlap is rejected above the documented raster tolerance; same-owner precedence is critical-detail, structural-detail, supporting, then base.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.
