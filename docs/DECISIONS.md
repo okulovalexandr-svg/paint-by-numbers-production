@@ -65,5 +65,8 @@ Semantic rectangles may be converted diagnostically into deterministic ownership
 ## D-021 — Phase S2 semantic simplification remains a dry-run
 Semantic microregions may be simplified only on a private post-S1/R2 clone and only inside one exact `face`, `hand` or `key-detail` owner. Critical masks, ambiguous ownership, strong local internal edges and owner silhouettes are hard invariants, and every batch must be rolled back on readiness, topology, color or coverage regression. The 8/12/16 Lab profiles are diagnostic Pareto probes, not production thresholds; S2 does not feed production output, UI approval or the immutable Final Region Map.
 
+## D-022 — Phase V1 semantic planes remain a validator-gated dry-run
+V1 may move weak internal semantic boundaries only inside one exact S1 `face`, `hand` or `key-detail` owner on a private post-B+C clone. Seeds use the existing exact 5 pt fit plus distance-transform anchors; deterministic pixel growth selects only existing production-paint medoids. Critical, ambiguous, silhouette and strong-edge barriers are immutable, each owner is independently rollbackable, and V1 has no production/UI/Final Region Map/numbering/contour/SVG/PDF call site.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

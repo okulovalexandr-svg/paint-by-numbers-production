@@ -375,6 +375,71 @@ export type SemanticSimplifierSimulationResult = {
   simulatedLabels: Uint8Array;
 };
 
+export type SemanticPlaneReconstructionSnapshot = SemanticSimplifierSnapshot;
+
+export type SemanticPlaneReconstructionRuntime = {
+  seedGenerationMs: number;
+  regionGrowingMs: number;
+  graphRebuildMs: number;
+  readinessMs: number;
+  totalMs: number;
+};
+
+export type SemanticPlaneReconstructionOwnerResult = {
+  ownerId: number;
+  kind: "face" | "hand" | "key-detail";
+  accepted: boolean;
+  rollbackReason?: string;
+  start: SemanticPlaneReconstructionSnapshot;
+  end: SemanticPlaneReconstructionSnapshot;
+  ownerFailStart: number;
+  ownerFailEnd: number;
+  seedsGenerated: number;
+  finalPlanes: number;
+  changedPixels: number;
+  changedAreaPercent: number;
+  changedPixelLabDelta: SemanticSimplifierLabDelta;
+  runtime: SemanticPlaneReconstructionRuntime;
+};
+
+export type SemanticPlaneReconstructionOptions = {
+  maxRuntimeMs?: number;
+  minimumSeedDistanceMm?: number;
+  maxSeedsPerOwner?: number;
+};
+
+export type SemanticPlaneReconstructionResult = {
+  width: number;
+  height: number;
+  start: SemanticPlaneReconstructionSnapshot;
+  end: SemanticPlaneReconstructionSnapshot;
+  ownerKinds: Record<"face" | "hand" | "key-detail", { failStart: number; failEnd: number }>;
+  reconstructedOwnersCount: number;
+  rolledBackOwnersCount: number;
+  seedsGenerated: number;
+  finalPlanes: number;
+  rasterAreaChangedPercent: number;
+  semanticAreaChangedPercent: number;
+  changedPixelLabDelta: SemanticSimplifierLabDelta;
+  criticalPixelsChanged: number;
+  ownerSilhouettePixelsChanged: number;
+  ownerSilhouetteBoundaryEdgesChanged: number;
+  strongEdgePixelsChanged: number;
+  strongEdgeBoundaryEdgesRemoved: number;
+  newFailuresCreated: number;
+  colorsBefore: number;
+  colorsAfter: number;
+  eliminatedColorCodes: string[];
+  runtime: SemanticPlaneReconstructionRuntime;
+  owners: SemanticPlaneReconstructionOwnerResult[];
+  capHit: boolean;
+  stopReason: "completed" | "runtime-cap";
+  finalRasterCheckpoint: string;
+  finalGraphCheckpoint: string;
+  finalGraph: RegionGraphDiagnosticResult;
+  simulatedLabels: Uint8Array;
+};
+
 export type PaintProcessResult = {
   preview: string;
   scheme: string;
@@ -3890,6 +3955,645 @@ export async function simulateSemanticObjectSimplifierFromLabelMap(
     finalRasterCheckpoint: checkpointIdentity(labels, paints, width, height),
     finalGraphCheckpoint: regionGraphCheckpoint(graph),
     trajectory: options.includeTrajectory ? trajectory : undefined,
+    finalGraph: graph,
+    simulatedLabels: labels,
+  };
+}
+
+/**
+ * Phase V1 diagnostic only. Reconstructs paint planes from pixels inside one
+ * unambiguous S1 semantic owner on a private label-map clone. There is no
+ * production/UI/approval call site for this simulator.
+ */
+export async function simulateValidatorSeededSemanticPlaneReconstructionFromLabelMap(
+  sourceLabels: Uint8Array,
+  width: number,
+  height: number,
+  paints: ProductionPaint[],
+  semanticRegions: SemanticRegion[],
+  semanticOwnership: RegionAlignedSemanticOwnershipResult,
+  options: SemanticPlaneReconstructionOptions = {},
+): Promise<SemanticPlaneReconstructionResult> {
+  if (width < 1 || height < 1 || sourceLabels.length !== width * height) throw new Error("Invalid semantic-plane label map dimensions");
+  if (!paints.length) throw new Error("Production palette is empty");
+  if (sourceLabels.some((label) => label >= paints.length)) throw new Error("Semantic-plane label is outside the production palette");
+  if (semanticOwnership.width !== width || semanticOwnership.height !== height
+    || semanticOwnership.semanticMask.length !== sourceLabels.length
+    || semanticOwnership.criticalMask.length !== sourceLabels.length) {
+    throw new Error("Semantic ownership dimensions do not match semantic-plane raster");
+  }
+  for (const owner of semanticOwnership.ownerMasks) {
+    if (owner.mask.length !== sourceLabels.length) throw new Error("Semantic owner mask dimensions do not match semantic-plane raster");
+  }
+
+  const startedAt = performance.now();
+  const maxRuntimeMs = Math.max(1, options.maxRuntimeMs ?? Number.POSITIVE_INFINITY);
+  const deadline = startedAt + maxRuntimeMs;
+  const timedOut = () => performance.now() >= deadline;
+  const minimumSeedDistanceMm = Math.max(1, options.minimumSeedDistanceMm ?? 6);
+  const maxSeedsPerOwner = Math.max(1, options.maxSeedsPerOwner ?? 2048);
+  const eligibleKinds = new Set<SemanticRegionKind>(["face", "hand", "key-detail"]);
+  const originalLabels = sourceLabels.slice();
+  let labels = sourceLabels.slice();
+  const labs = paints.map((paint) => rgbToLab(...hexToRgb(paint.hex)));
+  const pixelWidthMm = ARTWORK_WIDTH_MM / width;
+  const pixelHeightMm = ARTWORK_HEIGHT_MM / height;
+  const scale = printScale(width, height);
+  const pixelOwner = new Int32Array(labels.length);
+  pixelOwner.fill(-1);
+  for (const owner of semanticOwnership.ownerMasks) for (let pixel = 0; pixel < owner.mask.length; pixel++) {
+    if (!owner.mask[pixel]) continue;
+    if (pixelOwner[pixel] === -1) pixelOwner[pixel] = owner.ownerId;
+    else if (pixelOwner[pixel] !== owner.ownerId) pixelOwner[pixel] = -2;
+  }
+  const ownerKind = new Map(semanticOwnership.ownerMasks.map((owner) => [owner.ownerId, owner.kind]));
+  const ownerMaskById = new Map(semanticOwnership.ownerMasks.map((owner) => [owner.ownerId, owner.mask]));
+
+  const collectComponents = async (currentLabels: Uint8Array) => {
+    const components: Component[] = [];
+    const componentMap = new Int32Array(currentLabels.length);
+    componentMap.fill(-1);
+    await walkComponents(currentLabels, width, height, paints.length, (component) => {
+      const regionId = components.length;
+      components.push(component);
+      for (const pixel of component.pixels) componentMap[pixel] = regionId;
+    }, async () => undefined);
+    return { components, componentMap };
+  };
+  const exactOwnerOfComponent = (component: Component) => {
+    let exactOwner = -1;
+    for (const pixel of component.pixels) {
+      const candidate = pixelOwner[pixel];
+      if (candidate < 0) return -1;
+      if (exactOwner === -1) exactOwner = candidate;
+      else if (candidate !== exactOwner) return -1;
+    }
+    return exactOwner;
+  };
+  const snapshot = (graph: RegionGraphDiagnosticResult): SemanticPlaneReconstructionSnapshot => semanticSimplifierSnapshot(graph);
+  const changedLabSummary = (before: Uint8Array, after: Uint8Array, mask?: Uint8Array): SemanticSimplifierLabDelta => {
+    const values: number[] = [];
+    for (let pixel = 0; pixel < before.length; pixel++) {
+      if (before[pixel] === after[pixel] || (mask && !mask[pixel])) continue;
+      values.push(Math.sqrt(labDistance(labs[before[pixel]], labs[after[pixel]])));
+    }
+    values.sort((left, right) => left - right);
+    const percentile = (ratio: number) => values.length ? values[Math.max(0, Math.ceil(values.length * ratio) - 1)] : 0;
+    return {
+      mean: values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0,
+      median: percentile(0.5),
+      p90: percentile(0.9),
+      max: values[values.length - 1] ?? 0,
+    };
+  };
+  const activeColorCounts = (currentLabels: Uint8Array) => {
+    const counts = new Uint32Array(paints.length);
+    for (const label of currentLabels) counts[label]++;
+    return counts;
+  };
+
+  const ownerSilhouetteMask = new Uint8Array(labels.length);
+  const ownerSilhouetteEdges: Array<[number, number]> = [];
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x;
+    const currentOwner = pixelOwner[pixel];
+    if (currentOwner >= 0 && (x === 0 || x === width - 1 || y === 0 || y === height - 1)) ownerSilhouetteMask[pixel] = 1;
+    if (x + 1 < width && pixelOwner[pixel + 1] !== currentOwner && (currentOwner >= 0 || pixelOwner[pixel + 1] >= 0)) {
+      if (currentOwner >= 0) ownerSilhouetteMask[pixel] = 1;
+      if (pixelOwner[pixel + 1] >= 0) ownerSilhouetteMask[pixel + 1] = 1;
+      ownerSilhouetteEdges.push([pixel, pixel + 1]);
+    }
+    if (y + 1 < height && pixelOwner[pixel + width] !== currentOwner && (currentOwner >= 0 || pixelOwner[pixel + width] >= 0)) {
+      if (currentOwner >= 0) ownerSilhouetteMask[pixel] = 1;
+      if (pixelOwner[pixel + width] >= 0) ownerSilhouetteMask[pixel + width] = 1;
+      ownerSilhouetteEdges.push([pixel, pixel + width]);
+    }
+  }
+
+  const initialGraph = await buildRegionGraphDiagnosticFromLabelMap(labels, width, height, paints, semanticRegions, semanticOwnership);
+  const initialCollected = await collectComponents(labels);
+  const initialComponentOwners = initialCollected.components.map(exactOwnerOfComponent);
+  const internalDistances = new Map<number, number[]>();
+  for (const edge of initialGraph.edges) {
+    const leftOwner = initialComponentOwners[edge.regionA];
+    const rightOwner = initialComponentOwners[edge.regionB];
+    if (leftOwner < 0 || leftOwner !== rightOwner || !eligibleKinds.has(ownerKind.get(leftOwner) as SemanticRegionKind)) continue;
+    const values = internalDistances.get(leftOwner) || [];
+    values.push(edge.labDistance);
+    internalDistances.set(leftOwner, values);
+  }
+  const strongThresholds = new Map<number, number>();
+  for (const [ownerId, values] of internalDistances) {
+    values.sort((left, right) => left - right);
+    const p90 = values.length ? values[Math.max(0, Math.ceil(values.length * 0.9) - 1)] : 0;
+    strongThresholds.set(ownerId, Math.max(12, p90));
+  }
+  const strongPairs = new Set<string>();
+  for (const edge of initialGraph.edges) {
+    const ownerId = initialComponentOwners[edge.regionA];
+    if (ownerId < 0 || ownerId !== initialComponentOwners[edge.regionB]) continue;
+    if (edge.labDistance + 1e-9 >= (strongThresholds.get(ownerId) ?? 12)) strongPairs.add(`${edge.regionA}:${edge.regionB}`);
+  }
+  const strongEdgeMask = new Uint8Array(labels.length);
+  const strongBoundaryEdges: Array<[number, number]> = [];
+  const markStrongEdge = (leftPixel: number, rightPixel: number) => {
+    const leftRegion = initialCollected.componentMap[leftPixel];
+    const rightRegion = initialCollected.componentMap[rightPixel];
+    if (leftRegion === rightRegion) return;
+    const key = `${Math.min(leftRegion, rightRegion)}:${Math.max(leftRegion, rightRegion)}`;
+    if (!strongPairs.has(key)) return;
+    strongEdgeMask[leftPixel] = 1;
+    strongEdgeMask[rightPixel] = 1;
+    strongBoundaryEdges.push([leftPixel, rightPixel]);
+  };
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const pixel = y * width + x;
+    if (x + 1 < width) markStrongEdge(pixel, pixel + 1);
+    if (y + 1 < height) markStrongEdge(pixel, pixel + width);
+  }
+  const barrierMask = new Uint8Array(labels.length);
+  for (let pixel = 0; pixel < barrierMask.length; pixel++) {
+    if (semanticOwnership.criticalMask[pixel] || ownerSilhouetteMask[pixel] || strongEdgeMask[pixel]) barrierMask[pixel] = 1;
+  }
+
+  const initialColorCounts = activeColorCounts(labels);
+  const countOwnerFail = async (currentLabels: Uint8Array, graph: RegionGraphDiagnosticResult, ownerId: number) => {
+    const collected = await collectComponents(currentLabels);
+    let count = 0;
+    for (let regionId = 0; regionId < collected.components.length; regionId++) {
+      if (!graph.nodes[regionId].fits5Pt && exactOwnerOfComponent(collected.components[regionId]) === ownerId) count++;
+    }
+    return count;
+  };
+  const countKindFails = async (currentLabels: Uint8Array, graph: RegionGraphDiagnosticResult) => {
+    const counts: Record<"face" | "hand" | "key-detail", number> = { face: 0, hand: 0, "key-detail": 0 };
+    const collected = await collectComponents(currentLabels);
+    for (let regionId = 0; regionId < collected.components.length; regionId++) {
+      if (graph.nodes[regionId].fits5Pt) continue;
+      const kind = ownerKind.get(exactOwnerOfComponent(collected.components[regionId]));
+      if (kind && eligibleKinds.has(kind)) counts[kind as keyof typeof counts]++;
+    }
+    return counts;
+  };
+  const initialKindFails = await countKindFails(labels, initialGraph);
+  let graph = initialGraph;
+  const start = snapshot(graph);
+  const owners: SemanticPlaneReconstructionOwnerResult[] = [];
+  const totalRuntime: SemanticPlaneReconstructionRuntime = { seedGenerationMs: 0, regionGrowingMs: 0, graphRebuildMs: 0, readinessMs: 0, totalMs: 0 };
+  let reconstructedOwnersCount = 0;
+  let rolledBackOwnersCount = 0;
+  let seedsGenerated = 0;
+  let finalPlanes = 0;
+  let capHit = false;
+
+  const ownerIds = semanticOwnership.ownerMasks
+    .filter((owner) => eligibleKinds.has(owner.kind))
+    .map((owner) => owner.ownerId)
+    .sort((left, right) => left - right);
+  for (const ownerId of ownerIds) {
+    if (timedOut()) { capHit = true; break; }
+    const kind = ownerKind.get(ownerId) as "face" | "hand" | "key-detail";
+    const ownerStartedAt = performance.now();
+    const ownerRuntime: SemanticPlaneReconstructionRuntime = { seedGenerationMs: 0, regionGrowingMs: 0, graphRebuildMs: 0, readinessMs: 0, totalMs: 0 };
+    const ownerStartSnapshot = snapshot(graph);
+    const ownerFailStart = await countOwnerFail(labels, graph, ownerId);
+    const ownerMask = ownerMaskById.get(ownerId);
+    const eligibleMask = new Uint8Array(labels.length);
+    let ownerPixels = 0;
+    let eligiblePixels = 0;
+    for (let pixel = 0; pixel < labels.length; pixel++) {
+      if (!ownerMask?.[pixel] || pixelOwner[pixel] !== ownerId) continue;
+      ownerPixels++;
+      if (!barrierMask[pixel]) { eligibleMask[pixel] = 1; eligiblePixels++; }
+    }
+    if (!ownerPixels || !eligiblePixels) {
+      rolledBackOwnersCount++;
+      const ownerEnd = snapshot(graph);
+      ownerRuntime.totalMs = performance.now() - ownerStartedAt;
+      owners.push({ ownerId, kind, accepted: false, rollbackReason: "no-unambiguous-interior", start: ownerStartSnapshot, end: ownerEnd,
+        ownerFailStart, ownerFailEnd: ownerFailStart, seedsGenerated: 0, finalPlanes: 0, changedPixels: 0, changedAreaPercent: 0,
+        changedPixelLabDelta: { mean: 0, median: 0, p90: 0, max: 0 }, runtime: ownerRuntime });
+      continue;
+    }
+
+    const seedStartedAt = performance.now();
+    const distance = new Int32Array(labels.length);
+    distance.fill(-1);
+    const queue = new Int32Array(eligiblePixels);
+    let queueStart = 0;
+    let queueEnd = 0;
+    for (let pixel = 0; pixel < labels.length; pixel++) {
+      if (!eligibleMask[pixel]) continue;
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      let boundary = false;
+      for (const [dx, dy] of NEIGHBORS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height || !eligibleMask[ny * width + nx]) { boundary = true; break; }
+      }
+      if (boundary) { distance[pixel] = 1; queue[queueEnd++] = pixel; }
+    }
+    while (queueStart < queueEnd) {
+      const pixel = queue[queueStart++];
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      for (const [dx, dy] of NEIGHBORS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const next = ny * width + nx;
+        if (!eligibleMask[next] || distance[next] >= 0) continue;
+        distance[next] = distance[pixel] + 1;
+        queue[queueEnd++] = next;
+      }
+      if ((queueStart & 131071) === 0 && timedOut()) break;
+    }
+
+    const currentCollected = await collectComponents(labels);
+    const candidates: Array<{ pixel: number; distance: number; stable: boolean; area: number }> = [];
+    for (let regionId = 0; regionId < currentCollected.components.length; regionId++) {
+      const component = currentCollected.components[regionId];
+      if (exactOwnerOfComponent(component) !== ownerId || !graph.nodes[regionId].fits5Pt) continue;
+      let bestPixel = -1;
+      let bestDistance = -1;
+      for (const pixel of component.pixels) if (eligibleMask[pixel]
+        && (distance[pixel] > bestDistance || (distance[pixel] === bestDistance && pixel < bestPixel))) {
+        bestPixel = pixel; bestDistance = distance[pixel];
+      }
+      if (bestPixel >= 0) candidates.push({ pixel: bestPixel, distance: bestDistance, stable: true, area: component.pixels.length });
+    }
+    const minimumRadius = Math.max(1, Math.ceil(scale.minimumFontPx * 0.55));
+    for (let pixel = 0; pixel < labels.length; pixel++) {
+      if (!eligibleMask[pixel] || distance[pixel] < minimumRadius) continue;
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      let localMaximum = true;
+      for (const [dx, dy] of NEIGHBORS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const next = ny * width + nx;
+        if (distance[next] > distance[pixel] || (distance[next] === distance[pixel] && next < pixel)) { localMaximum = false; break; }
+      }
+      if (localMaximum) candidates.push({ pixel, distance: distance[pixel], stable: false, area: 0 });
+    }
+    candidates.sort((left, right) => Number(right.stable) - Number(left.stable)
+      || right.area - left.area || right.distance - left.distance || left.pixel - right.pixel);
+    const seeds: Array<{ pixel: number; label: number; x: number; y: number }> = [];
+    const grid = new Map<string, number[]>();
+    const cellMm = minimumSeedDistanceMm;
+    const canPlaceSeed = (pixel: number) => {
+      const xMm = (pixel % width + 0.5) * pixelWidthMm;
+      const yMm = (Math.floor(pixel / width) + 0.5) * pixelHeightMm;
+      const gx = Math.floor(xMm / cellMm);
+      const gy = Math.floor(yMm / cellMm);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        for (const seedId of grid.get(`${gx + dx}:${gy + dy}`) || []) {
+          const seed = seeds[seedId];
+          const deltaX = xMm - (seed.x + 0.5) * pixelWidthMm;
+          const deltaY = yMm - (seed.y + 0.5) * pixelHeightMm;
+          if (deltaX * deltaX + deltaY * deltaY < minimumSeedDistanceMm * minimumSeedDistanceMm - 1e-9) return false;
+        }
+      }
+      return true;
+    };
+    const addSeed = (pixel: number) => {
+      if (seeds.length >= maxSeedsPerOwner || !canPlaceSeed(pixel)) return false;
+      const x = pixel % width;
+      const y = Math.floor(pixel / width);
+      const seedId = seeds.length;
+      seeds.push({ pixel, label: labels[pixel], x, y });
+      const gx = Math.floor((x + 0.5) * pixelWidthMm / cellMm);
+      const gy = Math.floor((y + 0.5) * pixelHeightMm / cellMm);
+      const key = `${gx}:${gy}`;
+      const values = grid.get(key) || [];
+      values.push(seedId);
+      grid.set(key, values);
+      return true;
+    };
+    for (const candidate of candidates) addSeed(candidate.pixel);
+    // Guarantee one seed per traversable island, even when physical spacing
+    // suppression rejected all of that island's maxima.
+    const seen = new Uint8Array(labels.length);
+    const seedAt = new Uint8Array(labels.length);
+    for (const seed of seeds) seedAt[seed.pixel] = 1;
+    const islandQueue = new Int32Array(eligiblePixels);
+    for (let root = 0; root < labels.length; root++) {
+      if (!eligibleMask[root] || seen[root]) continue;
+      let begin = 0;
+      let end = 0;
+      islandQueue[end++] = root;
+      seen[root] = 1;
+      let hasSeed = false;
+      let bestPixel = root;
+      while (begin < end) {
+        const pixel = islandQueue[begin++];
+        if (seedAt[pixel]) hasSeed = true;
+        if (distance[pixel] > distance[bestPixel] || (distance[pixel] === distance[bestPixel] && pixel < bestPixel)) bestPixel = pixel;
+        const x = pixel % width;
+        const y = Math.floor(pixel / width);
+        for (const [dx, dy] of NEIGHBORS) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+          const next = ny * width + nx;
+          if (!eligibleMask[next] || seen[next]) continue;
+          seen[next] = 1;
+          islandQueue[end++] = next;
+        }
+      }
+      if (!hasSeed && seeds.length < maxSeedsPerOwner) {
+        const x = bestPixel % width;
+        const y = Math.floor(bestPixel / width);
+        seeds.push({ pixel: bestPixel, label: labels[bestPixel], x, y });
+        seedAt[bestPixel] = 1;
+      }
+    }
+    ownerRuntime.seedGenerationMs = performance.now() - seedStartedAt;
+    if (timedOut()) {
+      capHit = true;
+      rolledBackOwnersCount++;
+      ownerRuntime.totalMs = performance.now() - ownerStartedAt;
+      owners.push({ ownerId, kind, accepted: false, rollbackReason: "runtime-cap", start: ownerStartSnapshot, end: ownerStartSnapshot,
+        ownerFailStart, ownerFailEnd: ownerFailStart, seedsGenerated: seeds.length, finalPlanes: 0, changedPixels: 0, changedAreaPercent: 0,
+        changedPixelLabDelta: { mean: 0, median: 0, p90: 0, max: 0 }, runtime: ownerRuntime });
+      break;
+    }
+    if (!seeds.length) {
+      rolledBackOwnersCount++;
+      ownerRuntime.totalMs = performance.now() - ownerStartedAt;
+      owners.push({ ownerId, kind, accepted: false, rollbackReason: "no-valid-seed", start: ownerStartSnapshot, end: ownerStartSnapshot,
+        ownerFailStart, ownerFailEnd: ownerFailStart, seedsGenerated: 0, finalPlanes: 0, changedPixels: 0, changedAreaPercent: 0,
+        changedPixelLabDelta: { mean: 0, median: 0, p90: 0, max: 0 }, runtime: ownerRuntime });
+      continue;
+    }
+
+    const growingStartedAt = performance.now();
+    const plane = new Int32Array(labels.length);
+    plane.fill(-1);
+    const bestCost = new Float64Array(labels.length);
+    bestCost.fill(Number.POSITIVE_INFINITY);
+    const heapPixels: number[] = [];
+    const heapPlanes: number[] = [];
+    const heapCosts: number[] = [];
+    const heapLess = (left: number, right: number) => heapCosts[left] < heapCosts[right] - 1e-9
+      || (Math.abs(heapCosts[left] - heapCosts[right]) <= 1e-9 && (heapPlanes[left] < heapPlanes[right]
+        || (heapPlanes[left] === heapPlanes[right] && heapPixels[left] < heapPixels[right])));
+    const heapSwap = (left: number, right: number) => {
+      [heapPixels[left], heapPixels[right]] = [heapPixels[right], heapPixels[left]];
+      [heapPlanes[left], heapPlanes[right]] = [heapPlanes[right], heapPlanes[left]];
+      [heapCosts[left], heapCosts[right]] = [heapCosts[right], heapCosts[left]];
+    };
+    const heapPush = (pixel: number, planeId: number, cost: number) => {
+      let index = heapPixels.length;
+      heapPixels.push(pixel); heapPlanes.push(planeId); heapCosts.push(cost);
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (!heapLess(index, parent)) break;
+        heapSwap(index, parent); index = parent;
+      }
+    };
+    const heapPop = () => {
+      const item = { pixel: heapPixels[0], planeId: heapPlanes[0], cost: heapCosts[0] };
+      const lastPixel = heapPixels.pop()!;
+      const lastPlane = heapPlanes.pop()!;
+      const lastCost = heapCosts.pop()!;
+      if (heapPixels.length) {
+        heapPixels[0] = lastPixel; heapPlanes[0] = lastPlane; heapCosts[0] = lastCost;
+        let index = 0;
+        while (true) {
+          const left = index * 2 + 1;
+          const right = left + 1;
+          let best = index;
+          if (left < heapPixels.length && heapLess(left, best)) best = left;
+          if (right < heapPixels.length && heapLess(right, best)) best = right;
+          if (best === index) break;
+          heapSwap(index, best); index = best;
+        }
+      }
+      return item;
+    };
+    for (let seedId = 0; seedId < seeds.length; seedId++) {
+      const pixel = seeds[seedId].pixel;
+      if (bestCost[pixel] === 0 && plane[pixel] <= seedId) continue;
+      bestCost[pixel] = 0;
+      plane[pixel] = seedId;
+      heapPush(pixel, seedId, 0);
+    }
+    let popped = 0;
+    while (heapPixels.length) {
+      const current = heapPop();
+      if (current.cost > bestCost[current.pixel] + 1e-9 || plane[current.pixel] !== current.planeId) continue;
+      const x = current.pixel % width;
+      const y = Math.floor(current.pixel / width);
+      for (const [dx, dy] of NEIGHBORS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const next = ny * width + nx;
+        if (!eligibleMask[next]) continue;
+        const gradient = Math.sqrt(labDistance(labs[labels[current.pixel]], labs[labels[next]]));
+        const seedDeviation = Math.sqrt(labDistance(labs[seeds[current.planeId].label], labs[labels[next]]));
+        const step = 1 + gradient * 0.30 + seedDeviation * 0.08;
+        const nextCost = current.cost + step;
+        if (nextCost < bestCost[next] - 1e-9 || (Math.abs(nextCost - bestCost[next]) <= 1e-9 && current.planeId < plane[next])) {
+          bestCost[next] = nextCost;
+          plane[next] = current.planeId;
+          heapPush(next, current.planeId, nextCost);
+        }
+      }
+      popped++;
+      if ((popped & 65535) === 0 && timedOut()) break;
+    }
+    ownerRuntime.regionGrowingMs = performance.now() - growingStartedAt;
+    if (timedOut()) {
+      capHit = true;
+      rolledBackOwnersCount++;
+      ownerRuntime.totalMs = performance.now() - ownerStartedAt;
+      owners.push({ ownerId, kind, accepted: false, rollbackReason: "runtime-cap", start: ownerStartSnapshot, end: ownerStartSnapshot,
+        ownerFailStart, ownerFailEnd: ownerFailStart, seedsGenerated: seeds.length, finalPlanes: 0, changedPixels: 0, changedAreaPercent: 0,
+        changedPixelLabDelta: { mean: 0, median: 0, p90: 0, max: 0 }, runtime: ownerRuntime });
+      break;
+    }
+
+    const planeColorCounts = Array.from({ length: seeds.length }, () => new Map<number, number>());
+    for (let pixel = 0; pixel < plane.length; pixel++) if (plane[pixel] >= 0) {
+      const counts = planeColorCounts[plane[pixel]];
+      counts.set(labels[pixel], (counts.get(labels[pixel]) || 0) + 1);
+    }
+    const planeColors = planeColorCounts.map((counts, planeId) => {
+      const entries = [...counts.entries()].sort((left, right) => left[0] - right[0]);
+      let bestLabel = seeds[planeId].label;
+      let bestObjective = Number.POSITIVE_INFINITY;
+      for (const [candidate] of entries) {
+        let objective = 0;
+        for (const [original, count] of entries) objective += Math.sqrt(labDistance(labs[candidate], labs[original])) * count;
+        if (objective < bestObjective - 1e-9 || (Math.abs(objective - bestObjective) <= 1e-9 && candidate < bestLabel)) {
+          bestObjective = objective; bestLabel = candidate;
+        }
+      }
+      return bestLabel;
+    });
+    const trialLabels = labels.slice();
+    for (let pixel = 0; pixel < plane.length; pixel++) if (plane[pixel] >= 0) trialLabels[pixel] = planeColors[plane[pixel]];
+    const finalPlaneCount = new Set(planeColors).size;
+
+    const graphStartedAt = performance.now();
+    const trialGraph = await buildRegionGraphDiagnosticFromLabelMap(trialLabels, width, height, paints, semanticRegions, semanticOwnership);
+    ownerRuntime.graphRebuildMs = performance.now() - graphStartedAt;
+    const readinessStartedAt = performance.now();
+    const currentSnapshot = snapshot(graph);
+    const trialSnapshot = snapshot(trialGraph);
+    const trialCollected = await collectComponents(trialLabels);
+    const newlyFailedIds = new Set<number>();
+    for (let regionId = 0; regionId < currentCollected.components.length; regionId++) {
+      if (!graph.nodes[regionId].fits5Pt) continue;
+      for (const pixel of currentCollected.components[regionId].pixels) {
+        const trialRegionId = trialCollected.componentMap[pixel];
+        if (!trialGraph.nodes[trialRegionId]?.fits5Pt) newlyFailedIds.add(trialRegionId);
+      }
+    }
+    const trialColorCounts = activeColorCounts(trialLabels);
+    const eliminated = paints.some((_, index) => initialColorCounts[index] > 0 && trialColorCounts[index] === 0);
+    let criticalChanges = 0;
+    let silhouetteChanges = 0;
+    let strongChanges = 0;
+    for (let pixel = 0; pixel < labels.length; pixel++) {
+      if (trialLabels[pixel] === originalLabels[pixel]) continue;
+      if (semanticOwnership.criticalMask[pixel]) criticalChanges++;
+      if (ownerSilhouetteMask[pixel]) silhouetteChanges++;
+      if (strongEdgeMask[pixel]) strongChanges++;
+    }
+    let strongEdgesRemoved = 0;
+    for (const [left, right] of strongBoundaryEdges) {
+      if (originalLabels[left] !== originalLabels[right] && trialLabels[left] === trialLabels[right]) strongEdgesRemoved++;
+    }
+    const objectiveImproves = trialSnapshot.failCount < currentSnapshot.failCount
+      || (trialSnapshot.failCount === currentSnapshot.failCount && trialSnapshot.regions < currentSnapshot.regions);
+    const accepted = objectiveImproves
+      && trialSnapshot.failCount <= currentSnapshot.failCount
+      && trialSnapshot.fitCoverage + 1e-9 >= currentSnapshot.fitCoverage
+      && trialSnapshot.failedAreaPercent <= currentSnapshot.failedAreaPercent + 1e-9
+      && newlyFailedIds.size === 0
+      && criticalChanges === 0
+      && silhouetteChanges === 0
+      && strongChanges === 0
+      && strongEdgesRemoved === 0
+      && !eliminated;
+    const rollbackReason = accepted ? undefined
+      : eliminated ? "production-color-eliminated"
+        : criticalChanges ? "critical-pixel-change"
+          : silhouetteChanges ? "owner-silhouette-change"
+            : strongChanges || strongEdgesRemoved ? "strong-edge-change"
+              : newlyFailedIds.size ? "new-failure"
+                : !objectiveImproves ? "no-objective-improvement"
+                  : "readiness-regression";
+    ownerRuntime.readinessMs = performance.now() - readinessStartedAt;
+    let ownerFailEnd = ownerFailStart;
+    let ownerChangedPixels = 0;
+    if (accepted) {
+      labels = trialLabels;
+      graph = trialGraph;
+      reconstructedOwnersCount++;
+      ownerFailEnd = await countOwnerFail(labels, graph, ownerId);
+      for (let pixel = 0; pixel < labels.length; pixel++) if (ownerMask[pixel] && labels[pixel] !== originalLabels[pixel]) ownerChangedPixels++;
+      seedsGenerated += seeds.length;
+      finalPlanes += finalPlaneCount;
+    } else {
+      rolledBackOwnersCount++;
+    }
+    ownerRuntime.totalMs = performance.now() - ownerStartedAt;
+    totalRuntime.seedGenerationMs += ownerRuntime.seedGenerationMs;
+    totalRuntime.regionGrowingMs += ownerRuntime.regionGrowingMs;
+    totalRuntime.graphRebuildMs += ownerRuntime.graphRebuildMs;
+    totalRuntime.readinessMs += ownerRuntime.readinessMs;
+    owners.push({
+      ownerId,
+      kind,
+      accepted,
+      rollbackReason,
+      start: ownerStartSnapshot,
+      end: accepted ? snapshot(graph) : ownerStartSnapshot,
+      ownerFailStart,
+      ownerFailEnd,
+      seedsGenerated: seeds.length,
+      finalPlanes: finalPlaneCount,
+      changedPixels: accepted ? ownerChangedPixels : 0,
+      changedAreaPercent: accepted && ownerPixels ? ownerChangedPixels / ownerPixels * 100 : 0,
+      changedPixelLabDelta: accepted ? changedLabSummary(originalLabels, labels, ownerMask) : { mean: 0, median: 0, p90: 0, max: 0 },
+      runtime: ownerRuntime,
+    });
+  }
+
+  const end = snapshot(graph);
+  const finalKindFails = await countKindFails(labels, graph);
+  const finalColorCounts = activeColorCounts(labels);
+  const eliminatedColorCodes = paints.filter((_, index) => initialColorCounts[index] > 0 && finalColorCounts[index] === 0).map((paint) => paint.code);
+  let changedPixels = 0;
+  let changedSemanticPixels = 0;
+  let criticalPixelsChanged = 0;
+  let ownerSilhouettePixelsChanged = 0;
+  let strongEdgePixelsChanged = 0;
+  for (let pixel = 0; pixel < labels.length; pixel++) {
+    if (labels[pixel] === originalLabels[pixel]) continue;
+    changedPixels++;
+    if (semanticOwnership.semanticMask[pixel]) changedSemanticPixels++;
+    if (semanticOwnership.criticalMask[pixel]) criticalPixelsChanged++;
+    if (ownerSilhouetteMask[pixel]) ownerSilhouettePixelsChanged++;
+    if (strongEdgeMask[pixel]) strongEdgePixelsChanged++;
+  }
+  let ownerSilhouetteBoundaryEdgesChanged = 0;
+  for (const [left, right] of ownerSilhouetteEdges) {
+    if (labels[left] !== originalLabels[left] || labels[right] !== originalLabels[right]) ownerSilhouetteBoundaryEdgesChanged++;
+  }
+  let strongEdgeBoundaryEdgesRemoved = 0;
+  for (const [left, right] of strongBoundaryEdges) {
+    if (originalLabels[left] !== originalLabels[right] && labels[left] === labels[right]) strongEdgeBoundaryEdgesRemoved++;
+  }
+  const finalCollected = await collectComponents(labels);
+  const initialPassingToFinalFailures = new Set<number>();
+  for (let regionId = 0; regionId < initialCollected.components.length; regionId++) {
+    if (!initialGraph.nodes[regionId].fits5Pt) continue;
+    for (const pixel of initialCollected.components[regionId].pixels) {
+      const finalRegionId = finalCollected.componentMap[pixel];
+      if (!graph.nodes[finalRegionId]?.fits5Pt) initialPassingToFinalFailures.add(finalRegionId);
+    }
+  }
+  const semanticPixels = semanticOwnership.semanticMask.reduce((sum, value) => sum + value, 0);
+  totalRuntime.totalMs = performance.now() - startedAt;
+  return {
+    width,
+    height,
+    start,
+    end,
+    ownerKinds: {
+      face: { failStart: initialKindFails.face, failEnd: finalKindFails.face },
+      hand: { failStart: initialKindFails.hand, failEnd: finalKindFails.hand },
+      "key-detail": { failStart: initialKindFails["key-detail"], failEnd: finalKindFails["key-detail"] },
+    },
+    reconstructedOwnersCount,
+    rolledBackOwnersCount,
+    seedsGenerated,
+    finalPlanes,
+    rasterAreaChangedPercent: labels.length ? changedPixels / labels.length * 100 : 0,
+    semanticAreaChangedPercent: semanticPixels ? changedSemanticPixels / semanticPixels * 100 : 0,
+    changedPixelLabDelta: changedLabSummary(originalLabels, labels),
+    criticalPixelsChanged,
+    ownerSilhouettePixelsChanged,
+    ownerSilhouetteBoundaryEdgesChanged,
+    strongEdgePixelsChanged,
+    strongEdgeBoundaryEdgesRemoved,
+    newFailuresCreated: initialPassingToFinalFailures.size,
+    colorsBefore: [...initialColorCounts].filter(Boolean).length,
+    colorsAfter: [...finalColorCounts].filter(Boolean).length,
+    eliminatedColorCodes,
+    runtime: totalRuntime,
+    owners,
+    capHit,
+    stopReason: capHit ? "runtime-cap" : "completed",
+    finalRasterCheckpoint: checkpointIdentity(labels, paints, width, height),
+    finalGraphCheckpoint: regionGraphCheckpoint(graph),
     finalGraph: graph,
     simulatedLabels: labels,
   };
