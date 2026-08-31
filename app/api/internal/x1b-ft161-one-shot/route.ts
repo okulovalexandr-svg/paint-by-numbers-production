@@ -6,6 +6,7 @@ import {
   runFt161CloudflareOneShot,
 } from "../../../../lib/semantic-plane-cloudflare-one-shot.ts";
 import { getChatGPTUser } from "../../../chatgpt-auth";
+import { X1B_BROWSER_CARRIED_ASSETS, sha256Hex } from "../../../../lib/x1b-browser-launcher.ts";
 
 type D1ResultLike = { meta?: { changes?: number } };
 type D1StatementLike = {
@@ -36,34 +37,46 @@ async function claimFt161Once(database: D1DatabaseLike | undefined) {
   return result.meta?.changes === 1;
 }
 
-async function loadFixedAsset(request: Request, path: string) {
-  const headers = new Headers({ Accept: "image/*" });
-  for (const name of ["cookie", "authorization", "oai-sites-authorization"]) {
-    const value = request.headers.get(name);
-    if (value) headers.set(name, value);
-  }
-  const response = await fetch(new URL(path, request.url), {
-    method: "GET",
-    headers,
-  });
-  if (!response.ok) throw new Error(`Fixed FT161 asset ${path} returned HTTP ${response.status}`);
-  return new Uint8Array(await response.arrayBuffer());
-}
-
 export async function POST(request: Request) {
   const identity = await getChatGPTUser();
   const runtime = env as unknown as X1BRuntime;
+  let carriedFiles: Record<string, File> | null = null;
+
+  const readRequestBody = async () => {
+    if (!request.headers.get("content-type")?.startsWith("multipart/form-data")) {
+      try { return await request.json(); } catch { return null; }
+    }
+    const form = await request.formData();
+    const source = form.get(X1B_BROWSER_CARRIED_ASSETS.source.field);
+    const approved = form.get(X1B_BROWSER_CARRIED_ASSETS.approved.field);
+    carriedFiles = source instanceof File && approved instanceof File ? { source, approved } : null;
+    return { fixture: form.get("fixture"), confirmation: form.get("confirmation") };
+  };
+
+  const loadCarriedAsset = async (path: string) => {
+    const spec = path === X1B_BROWSER_CARRIED_ASSETS.source.path
+      ? X1B_BROWSER_CARRIED_ASSETS.source
+      : path === X1B_BROWSER_CARRIED_ASSETS.approved.path
+        ? X1B_BROWSER_CARRIED_ASSETS.approved
+        : null;
+    if (!spec || !carriedFiles) throw new Error(`Missing browser-carried FT161 asset ${path}`);
+    const file = carriedFiles[spec.field];
+    if (!file || file.name !== spec.filename || file.type !== spec.type || file.size !== spec.size) {
+      throw new Error(`Invalid browser-carried FT161 asset metadata for ${path}`);
+    }
+    const buffer = await file.arrayBuffer();
+    if (await sha256Hex(buffer) !== spec.sha256) throw new Error(`Invalid browser-carried FT161 asset SHA-256 for ${path}`);
+    return new Uint8Array(buffer);
+  };
 
   const result = await runFt161CloudflareOneShot({
     authenticatedEmail: identity?.email,
-    readRequestBody: async () => {
-      try { return await request.json(); } catch { return null; }
-    },
+    readRequestBody,
   }, {
     apiKey: runtime.OPENAI_API_KEY,
     authorizeOwner: (email) => isExistingHobrukOwner(runtime.DB, email),
     claimOnce: () => claimFt161Once(runtime.DB),
-    loadAsset: (path) => loadFixedAsset(request, path),
+    loadAsset: loadCarriedAsset,
     openAiFetch: fetch,
   });
 

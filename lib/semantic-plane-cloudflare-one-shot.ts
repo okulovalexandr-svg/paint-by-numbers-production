@@ -153,9 +153,6 @@ export async function runFt161CloudflareOneShot(
   if (!exactConfirmation(requestBody)) {
     return noStore(400, { error: "Exact FT161 one-shot confirmation is required", code: "x1b_confirmation_required" });
   }
-  const apiKey = dependencies.apiKey;
-  if (!apiKey) return noStore(503, { error: "OPENAI_API_KEY is not configured", code: "x1b_openai_not_configured" });
-
   let sourceBytes: Uint8Array;
   let approvedBytes: Uint8Array;
   try {
@@ -167,6 +164,9 @@ export async function runFt161CloudflareOneShot(
       code: "x1b_fixed_asset_failed",
     });
   }
+
+  const apiKey = dependencies.apiKey;
+  if (!apiKey) return noStore(503, { error: "OPENAI_API_KEY is not configured", code: "x1b_openai_not_configured" });
 
   let dimensions: { width: number; height: number };
   try { dimensions = approvedPngDimensions(approvedBytes); } catch (error) {

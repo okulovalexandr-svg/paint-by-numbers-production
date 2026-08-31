@@ -164,7 +164,7 @@ test("X1B authorization DB failure fails closed before body, assets, claim, or A
   assert.deepEqual(audit, { body: 0, assets: 0, claims: 0, api: 0 });
 });
 
-test("X1B exact confirmation and API-key guards both run before assets, claim, or AI", async () => {
+test("X1B exact confirmation runs before assets; API-key guard runs after carried-asset validation and before claim or AI", async () => {
   const audit = { assets: 0, claims: 0, api: 0 };
   const guarded = {
     claimOnce: async () => { audit.claims++; return true; },
@@ -185,10 +185,10 @@ test("X1B exact confirmation and API-key guards both run before assets, claim, o
   assert.equal(badConfirmation.body.code, "x1b_confirmation_required");
   assert.equal(missingApiKey.status, 503);
   assert.equal(missingApiKey.body.code, "x1b_openai_not_configured");
-  assert.deepEqual(audit, { assets: 0, claims: 0, api: 0 });
+  assert.deepEqual(audit, { assets: 2, claims: 0, api: 0 });
 });
 
-test("X1B successful ordering is identity owner, confirmation, key, fixed assets, claim, then one fetch", async () => {
+test("X1B successful ordering is identity owner, confirmation, carried assets, key, claim, then one fetch", async () => {
   const order = [];
   const deps = dependencies({
     authorizeOwner: async (email) => { order.push(`owner:${email}`); return true; },
@@ -219,9 +219,9 @@ test("X1B successful ordering is identity owner, confirmation, key, fixed assets
   assert.deepEqual(order, [
     "owner:owner@hobruk.test",
     "confirmation",
-    "api-key",
     `asset:${FT161_CLOUDFLARE_ONE_SHOT.sourceAssetPath}`,
     `asset:${FT161_CLOUDFLARE_ONE_SHOT.approvedAssetPath}`,
+    "api-key",
     "claim",
     "fetch",
   ]);

@@ -3,10 +3,12 @@
 import { useRef, useState } from "react";
 
 import {
+  X1B_BROWSER_CARRIED_ASSETS,
   X1B_BROWSER_LIVE_BODY,
   X1B_BROWSER_PRECHECK_BODY,
   X1B_ONE_SHOT_ROUTE_PATH,
   isX1bBrowserPrecheckPass,
+  sha256Hex,
 } from "../../../lib/x1b-browser-launcher.ts";
 
 type RouteResult = {
@@ -34,6 +36,40 @@ async function postX1b(body: object): Promise<RouteResult> {
   return { status: response.status, body: parsedBody, rawBody };
 }
 
+async function loadCarriedAsset(spec: (typeof X1B_BROWSER_CARRIED_ASSETS)[keyof typeof X1B_BROWSER_CARRIED_ASSETS]) {
+  const response = await fetch(spec.path, {
+    method: "GET",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: spec.type },
+  });
+  if (!response.ok) throw new Error(`${spec.path} returned HTTP ${response.status}`);
+  const bytes = await response.arrayBuffer();
+  if (bytes.byteLength !== spec.size) throw new Error(`${spec.filename} size ${bytes.byteLength} != ${spec.size}`);
+  const hash = await sha256Hex(bytes);
+  if (hash !== spec.sha256) throw new Error(`${spec.filename} SHA-256 mismatch`);
+  return new File([bytes], spec.filename, { type: spec.type });
+}
+
+async function postX1bLive(source: File, approved: File): Promise<RouteResult> {
+  const body = new FormData();
+  body.set("fixture", X1B_BROWSER_LIVE_BODY.fixture);
+  body.set("confirmation", X1B_BROWSER_LIVE_BODY.confirmation);
+  body.set(X1B_BROWSER_CARRIED_ASSETS.source.field, source);
+  body.set(X1B_BROWSER_CARRIED_ASSETS.approved.field, approved);
+  const response = await fetch(X1B_ONE_SHOT_ROUTE_PATH, {
+    method: "POST",
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    body,
+  });
+  const rawBody = await response.text();
+  let parsedBody: unknown = null;
+  try { parsedBody = JSON.parse(rawBody) as unknown; } catch { parsedBody = rawBody; }
+  return { status: response.status, body: parsedBody, rawBody };
+}
+
 function formattedResult(result: RouteResult | null) {
   if (!result) return "";
   return JSON.stringify({ status: result.status, body: result.body }, null, 2);
@@ -42,10 +78,13 @@ function formattedResult(result: RouteResult | null) {
 export function X1bFt161Launcher() {
   const [precheckState, setPrecheckState] = useState<LauncherState>("idle");
   const [precheckResult, setPrecheckResult] = useState<RouteResult | null>(null);
+  const [assetState, setAssetState] = useState<LauncherState>("idle");
+  const [assetResult, setAssetResult] = useState<string>("");
   const [liveState, setLiveState] = useState<LauncherState>("idle");
   const [liveResult, setLiveResult] = useState<RouteResult | null>(null);
   const [liveLocked, setLiveLocked] = useState(false);
   const liveDispatched = useRef(false);
+  const carriedAssets = useRef<{ source: File; approved: File } | null>(null);
 
   async function runPrecheck() {
     if (precheckState === "running" || liveDispatched.current) return;
@@ -54,7 +93,19 @@ export function X1bFt161Launcher() {
     try {
       const result = await postX1b(X1B_BROWSER_PRECHECK_BODY);
       setPrecheckResult(result);
-      setPrecheckState(isX1bBrowserPrecheckPass(result.status, result.body) ? "passed" : "failed");
+      if (!isX1bBrowserPrecheckPass(result.status, result.body)) {
+        setPrecheckState("failed");
+        return;
+      }
+      setPrecheckState("passed");
+      setAssetState("running");
+      const [source, approved] = await Promise.all([
+        loadCarriedAsset(X1B_BROWSER_CARRIED_ASSETS.source),
+        loadCarriedAsset(X1B_BROWSER_CARRIED_ASSETS.approved),
+      ]);
+      carriedAssets.current = { source, approved };
+      setAssetResult(`PASS — ${source.name} ${source.size} bytes; ${approved.name} ${approved.size} bytes`);
+      setAssetState("passed");
     } catch (error) {
       setPrecheckResult({
         status: 0,
@@ -62,17 +113,18 @@ export function X1bFt161Launcher() {
         rawBody: "",
       });
       setPrecheckState("failed");
+      setAssetState("failed");
     }
   }
 
   async function runLiveOnce() {
-    if (precheckState !== "passed" || liveDispatched.current) return;
+    if (precheckState !== "passed" || assetState !== "passed" || !carriedAssets.current || liveDispatched.current) return;
     liveDispatched.current = true;
     setLiveLocked(true);
     setLiveState("running");
     setLiveResult(null);
     try {
-      const result = await postX1b(X1B_BROWSER_LIVE_BODY);
+      const result = await postX1bLive(carriedAssets.current.source, carriedAssets.current.approved);
       setLiveResult(result);
       setLiveState(result.status === 200 || result.status === 422 ? "passed" : "failed");
     } catch (error) {
@@ -110,12 +162,18 @@ export function X1bFt161Launcher() {
       </section>
 
       <section style={{ marginTop: 32 }}>
-        <h2 style={{ fontSize: 18 }}>2. One irreversible LIVE dispatch</h2>
+        <h2 style={{ fontSize: 18 }}>2. Browser-carried asset validation</h2>
+        <p data-testid="x1b-asset-status" aria-live="polite">{assetState.toUpperCase()}</p>
+        {assetResult ? <pre data-testid="x1b-asset-result">{assetResult}</pre> : null}
+      </section>
+
+      <section style={{ marginTop: 32 }}>
+        <h2 style={{ fontSize: 18 }}>3. One irreversible LIVE dispatch</h2>
         <button
           data-testid="x1b-live-button"
           type="button"
           onClick={runLiveOnce}
-          disabled={precheckState !== "passed" || liveLocked}
+          disabled={precheckState !== "passed" || assetState !== "passed" || liveLocked}
         >
           {liveState === "running" ? "LIVE dispatched — waiting…" : liveLocked ? "LIVE locked — no retry" : "RUN FT161 X1B ONCE"}
         </button>
