@@ -4,9 +4,9 @@ import test from "node:test";
 
 import {
   FT161_CLOUDFLARE_ONE_SHOT,
+  X1B_EXISTING_OWNER_QUERY,
   X1B_HOBRUK_ORG_ID,
-  X1B_SOLE_OWNER_QUERY,
-  isSoleExistingHobrukOwner,
+  isExistingHobrukOwner,
   runFt161CloudflareOneShot,
 } from "../lib/semantic-plane-cloudflare-one-shot.ts";
 
@@ -42,7 +42,7 @@ function dependencies(overrides = {}) {
   let claimed = false;
   return {
     apiKey: "synthetic-key-never-sent",
-    authorizeSoleOwner: async () => true,
+    authorizeOwner: async () => true,
     claimOnce: async () => {
       if (claimed) return false;
       claimed = true;
@@ -91,22 +91,21 @@ function ownerDatabase(row, audit) {
   };
 }
 
-test("X1B sole-owner authorization is one read-only joined query and fails closed for non-owner cardinalities", async () => {
+test("X1B existing-owner authorization is one read-only joined query and ignores other owners", async () => {
   const scenarios = [
-    { row: { owner_count: 0, matching_owner_count: 0 }, expected: false, label: "0 owners" },
-    { row: { owner_count: 1, matching_owner_count: 0 }, expected: false, label: "non-owner" },
-    { row: { owner_count: 2, matching_owner_count: 1 }, expected: false, label: ">1 owners" },
-    { row: { owner_count: "1", matching_owner_count: "1" }, expected: true, label: "sole matching owner" },
+    { row: { matching_owner_count: 0 }, expected: false, label: "non-owner" },
+    { row: { matching_owner_count: 2 }, expected: false, label: "ambiguous duplicate membership" },
+    { row: { owner_count: 2, matching_owner_count: "1" }, expected: true, label: "matching owner with another owner" },
   ];
 
   for (const scenario of scenarios) {
     const audit = { queries: [], bindings: [], firstCalls: 0, writeCalls: 0 };
-    const authorized = await isSoleExistingHobrukOwner(
+    const authorized = await isExistingHobrukOwner(
       ownerDatabase(scenario.row, audit),
       "Owner@Hobruk.Test",
     );
     assert.equal(authorized, scenario.expected, scenario.label);
-    assert.deepEqual(audit.queries, [X1B_SOLE_OWNER_QUERY]);
+    assert.deepEqual(audit.queries, [X1B_EXISTING_OWNER_QUERY]);
     assert.deepEqual(audit.bindings, [["Owner@Hobruk.Test", X1B_HOBRUK_ORG_ID]]);
     assert.equal(audit.firstCalls, 1);
     assert.equal(audit.writeCalls, 0);
@@ -118,7 +117,7 @@ test("X1B sole-owner authorization is one read-only joined query and fails close
 test("X1B route source uses read-only identity authorization and has no workspace/token mutation boundary", async () => {
   const source = await readFile(new URL("../app/api/internal/x1b-ft161-one-shot/route.ts", import.meta.url), "utf8");
   assert.match(source, /getChatGPTUser/);
-  assert.match(source, /isSoleExistingHobrukOwner/);
+  assert.match(source, /isExistingHobrukOwner/);
   assert.doesNotMatch(source, /ensureWorkspaceUser/);
   const removedSecretName = ["X1B", "ONE", "SHOT", "TOKEN"].join("_");
   const removedHeaderName = ["x", "x1b", "one", "shot", "token"].join("-");
@@ -129,7 +128,7 @@ test("X1B route source uses read-only identity authorization and has no workspac
 test("X1B unauthenticated and non-owner requests stop before body, assets, claim, or AI", async () => {
   const audit = { auth: 0, body: 0, assets: 0, claims: 0, api: 0 };
   const deps = dependencies({
-    authorizeSoleOwner: async () => { audit.auth++; return false; },
+    authorizeOwner: async () => { audit.auth++; return false; },
     claimOnce: async () => { audit.claims++; return true; },
     loadAsset: async () => { audit.assets++; return approvedPng(); },
     openAiFetch: async () => { audit.api++; throw new Error("must not run"); },
@@ -144,8 +143,24 @@ test("X1B unauthenticated and non-owner requests stop before body, assets, claim
   assert.equal(unauthenticated.status, 401);
   assert.equal(unauthenticated.body.code, "x1b_unauthorized");
   assert.equal(nonOwner.status, 403);
-  assert.equal(nonOwner.body.code, "x1b_sole_owner_required");
+  assert.equal(nonOwner.body.code, "x1b_owner_required");
   assert.deepEqual(audit, { auth: 1, body: 0, assets: 0, claims: 0, api: 0 });
+});
+
+test("X1B authorization DB failure fails closed before body, assets, claim, or AI", async () => {
+  const audit = { body: 0, assets: 0, claims: 0, api: 0 };
+  const result = await runFt161CloudflareOneShot(authorizedInput({
+    readRequestBody: async () => { audit.body++; return confirmation(); },
+  }), dependencies({
+    authorizeOwner: async () => { throw new Error("synthetic DB failure"); },
+    claimOnce: async () => { audit.claims++; return true; },
+    loadAsset: async () => { audit.assets++; return approvedPng(); },
+    openAiFetch: async () => { audit.api++; throw new Error("must not run"); },
+  }));
+
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, "x1b_authorization_unavailable");
+  assert.deepEqual(audit, { body: 0, assets: 0, claims: 0, api: 0 });
 });
 
 test("X1B exact confirmation and API-key guards both run before assets, claim, or AI", async () => {
@@ -175,7 +190,7 @@ test("X1B exact confirmation and API-key guards both run before assets, claim, o
 test("X1B successful ordering is identity owner, confirmation, key, fixed assets, claim, then one fetch", async () => {
   const order = [];
   const deps = dependencies({
-    authorizeSoleOwner: async (email) => { order.push(`owner:${email}`); return true; },
+    authorizeOwner: async (email) => { order.push(`owner:${email}`); return true; },
     loadAsset: async (path) => {
       order.push(`asset:${path}`);
       return path === FT161_CLOUDFLARE_ONE_SHOT.sourceAssetPath

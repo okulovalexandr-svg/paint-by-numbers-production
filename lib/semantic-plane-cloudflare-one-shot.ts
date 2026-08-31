@@ -18,13 +18,12 @@ export const FT161_CLOUDFLARE_ONE_SHOT = Object.freeze({
 });
 
 export const X1B_HOBRUK_ORG_ID = "org_hobruk";
-export const X1B_SOLE_OWNER_QUERY = [
+export const X1B_EXISTING_OWNER_QUERY = [
   "SELECT",
-  "COUNT(*) AS owner_count,",
-  "COALESCE(SUM(CASE WHEN LOWER(u.email) = LOWER(?) THEN 1 ELSE 0 END), 0) AS matching_owner_count",
+  "COUNT(*) AS matching_owner_count",
   "FROM memberships AS m",
   "INNER JOIN users AS u ON u.id = m.user_id",
-  "WHERE m.organization_id = ? AND m.role = 'owner'",
+  "WHERE LOWER(u.email) = LOWER(?) AND m.organization_id = ? AND m.role = 'owner'",
 ].join(" ");
 
 export type X1BReadStatementLike = {
@@ -37,7 +36,6 @@ export type X1BReadDatabaseLike = {
 };
 
 type X1BOwnerAuthorizationRow = {
-  owner_count?: number | string | null;
   matching_owner_count?: number | string | null;
 };
 
@@ -66,23 +64,22 @@ export type Ft161OneShotResult = {
 
 export type Ft161OneShotDependencies = {
   apiKey?: string;
-  authorizeSoleOwner: (email: string) => Promise<boolean>;
+  authorizeOwner: (email: string) => Promise<boolean>;
   claimOnce: () => Promise<boolean>;
   loadAsset: (path: string) => Promise<Uint8Array>;
   openAiFetch: typeof fetch;
   now?: () => number;
 };
 
-export async function isSoleExistingHobrukOwner(
+export async function isExistingHobrukOwner(
   database: X1BReadDatabaseLike | undefined,
   authenticatedEmail: string,
 ) {
   if (!database) throw new Error("Cloudflare D1 binding DB is unavailable");
-  const row = await database.prepare(X1B_SOLE_OWNER_QUERY)
+  const row = await database.prepare(X1B_EXISTING_OWNER_QUERY)
     .bind(authenticatedEmail, X1B_HOBRUK_ORG_ID)
     .first<X1BOwnerAuthorizationRow>();
-  return Number(row?.owner_count || 0) === 1
-    && Number(row?.matching_owner_count || 0) === 1;
+  return Number(row?.matching_owner_count || 0) === 1;
 }
 
 function exactConfirmation(input: unknown) {
@@ -140,14 +137,14 @@ export async function runFt161CloudflareOneShot(
     return noStore(401, { error: "authentication required", code: "x1b_unauthorized" });
   }
 
-  let soleExistingOwner = false;
+  let existingOwner = false;
   try {
-    soleExistingOwner = await dependencies.authorizeSoleOwner(authenticatedEmail);
+    existingOwner = await dependencies.authorizeOwner(authenticatedEmail);
   } catch {
     return noStore(503, { error: "X1B owner authorization is unavailable", code: "x1b_authorization_unavailable" });
   }
-  if (!soleExistingOwner) {
-    return noStore(403, { error: "sole existing Hobruk owner required", code: "x1b_sole_owner_required" });
+  if (!existingOwner) {
+    return noStore(403, { error: "existing Hobruk owner required", code: "x1b_owner_required" });
   }
 
   let requestBody: unknown = null;

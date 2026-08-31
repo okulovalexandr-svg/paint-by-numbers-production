@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 
 import {
   FT161_CLOUDFLARE_ONE_SHOT,
-  isSoleExistingHobrukOwner,
+  isExistingHobrukOwner,
   runFt161CloudflareOneShot,
 } from "../../../../lib/semantic-plane-cloudflare-one-shot.ts";
 import { getChatGPTUser } from "../../../chatgpt-auth";
@@ -61,7 +61,7 @@ export async function POST(request: Request) {
     },
   }, {
     apiKey: runtime.OPENAI_API_KEY,
-    authorizeSoleOwner: (email) => isSoleExistingHobrukOwner(runtime.DB, email),
+    authorizeOwner: (email) => isExistingHobrukOwner(runtime.DB, email),
     claimOnce: () => claimFt161Once(runtime.DB),
     loadAsset: (path) => loadFixedAsset(request, path),
     openAiFetch: fetch,
