@@ -74,5 +74,8 @@ W1 may measure deterministic original-source Lab gradients across immutable acce
 ## D-024 — X1A semantic planes are a strict isolated geometry contract
 X1A defines normalized polygon owners and internal paint planes with deterministic validation, raster precedence, ambiguity handling and exact 5 pt component preflight. It carries no production colour, never repairs invalid geometry, and has no AI/API/production/UI/approval/Final Region Map/numbering/contour/SVG/PDF call site. Cross-owner overlap is rejected above the documented raster tolerance; same-owner precedence is critical-detail, structural-detail, supporting, then base.
 
+## D-025 — X1B temporary live authorization is read-only and sole-owner gated
+The temporary FT161 X1B route reads the current ChatGPT email without provisioning a workspace user and authorizes only when one read-only `users` + `memberships` query proves that email is the sole existing `owner` of `org_hobruk`. Zero or multiple owners and non-matching identities fail closed before confirmation, assets, claim or OpenAI. The route does not depend on a new remote token or make authorization-time D1 writes; its fixed assets, atomic one-shot claim, one-request limit and zero-retry contract remain unchanged.
+
 ## Next missing artifact
 The repository still needs the actual Golden Reference files (approved source image, approved preview, and preferably the known-good contour/reference output). Once available, store them under a `golden/` directory and use them as regression fixtures.

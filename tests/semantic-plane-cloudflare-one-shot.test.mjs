@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   FT161_CLOUDFLARE_ONE_SHOT,
+  X1B_HOBRUK_ORG_ID,
+  X1B_SOLE_OWNER_QUERY,
+  isSoleExistingHobrukOwner,
   runFt161CloudflareOneShot,
 } from "../lib/semantic-plane-cloudflare-one-shot.ts";
 
@@ -38,7 +42,7 @@ function dependencies(overrides = {}) {
   let claimed = false;
   return {
     apiKey: "synthetic-key-never-sent",
-    expectedToken: "synthetic-one-shot-token",
+    authorizeSoleOwner: async () => true,
     claimOnce: async () => {
       if (claimed) return false;
       claimed = true;
@@ -58,63 +62,184 @@ function dependencies(overrides = {}) {
 
 function authorizedInput(overrides = {}) {
   return {
-    authorized: true,
-    providedToken: "synthetic-one-shot-token",
-    requestBody: confirmation(),
+    authenticatedEmail: "owner@hobruk.test",
+    readRequestBody: async () => confirmation(),
     ...overrides,
   };
 }
 
-test("X1B Cloudflare route guards refuse before loading assets or calling AI", async () => {
-  let assetLoads = 0;
-  let apiCalls = 0;
+function ownerDatabase(row, audit) {
+  return {
+    prepare(query) {
+      audit.queries.push(query);
+      const statement = {
+        bind(...values) {
+          audit.bindings.push(values);
+          return statement;
+        },
+        async first() {
+          audit.firstCalls++;
+          return row;
+        },
+        async run() {
+          audit.writeCalls++;
+          throw new Error("authorization must never write");
+        },
+      };
+      return statement;
+    },
+  };
+}
+
+test("X1B sole-owner authorization is one read-only joined query and fails closed for non-owner cardinalities", async () => {
+  const scenarios = [
+    { row: { owner_count: 0, matching_owner_count: 0 }, expected: false, label: "0 owners" },
+    { row: { owner_count: 1, matching_owner_count: 0 }, expected: false, label: "non-owner" },
+    { row: { owner_count: 2, matching_owner_count: 1 }, expected: false, label: ">1 owners" },
+    { row: { owner_count: "1", matching_owner_count: "1" }, expected: true, label: "sole matching owner" },
+  ];
+
+  for (const scenario of scenarios) {
+    const audit = { queries: [], bindings: [], firstCalls: 0, writeCalls: 0 };
+    const authorized = await isSoleExistingHobrukOwner(
+      ownerDatabase(scenario.row, audit),
+      "Owner@Hobruk.Test",
+    );
+    assert.equal(authorized, scenario.expected, scenario.label);
+    assert.deepEqual(audit.queries, [X1B_SOLE_OWNER_QUERY]);
+    assert.deepEqual(audit.bindings, [["Owner@Hobruk.Test", X1B_HOBRUK_ORG_ID]]);
+    assert.equal(audit.firstCalls, 1);
+    assert.equal(audit.writeCalls, 0);
+    assert.match(audit.queries[0], /^SELECT\b/);
+    assert.doesNotMatch(audit.queries[0], /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b/i);
+  }
+});
+
+test("X1B route source uses read-only identity authorization and has no workspace/token mutation boundary", async () => {
+  const source = await readFile(new URL("../app/api/internal/x1b-ft161-one-shot/route.ts", import.meta.url), "utf8");
+  assert.match(source, /getChatGPTUser/);
+  assert.match(source, /isSoleExistingHobrukOwner/);
+  assert.doesNotMatch(source, /ensureWorkspaceUser/);
+  const removedSecretName = ["X1B", "ONE", "SHOT", "TOKEN"].join("_");
+  const removedHeaderName = ["x", "x1b", "one", "shot", "token"].join("-");
+  assert.equal(source.includes(removedSecretName), false);
+  assert.equal(source.includes(removedHeaderName), false);
+});
+
+test("X1B unauthenticated and non-owner requests stop before body, assets, claim, or AI", async () => {
+  const audit = { auth: 0, body: 0, assets: 0, claims: 0, api: 0 };
   const deps = dependencies({
-    loadAsset: async () => { assetLoads++; return approvedPng(); },
-    openAiFetch: async () => { apiCalls++; throw new Error("must not run"); },
+    authorizeSoleOwner: async () => { audit.auth++; return false; },
+    claimOnce: async () => { audit.claims++; return true; },
+    loadAsset: async () => { audit.assets++; return approvedPng(); },
+    openAiFetch: async () => { audit.api++; throw new Error("must not run"); },
+  });
+  const input = authorizedInput({
+    readRequestBody: async () => { audit.body++; return confirmation(); },
   });
 
-  assert.equal((await runFt161CloudflareOneShot(authorizedInput({ authorized: false }), deps)).status, 401);
-  assert.equal((await runFt161CloudflareOneShot(authorizedInput({ providedToken: "wrong" }), deps)).status, 403);
-  assert.equal((await runFt161CloudflareOneShot(authorizedInput({ requestBody: { fixture: "FT161" } }), deps)).status, 400);
-  assert.equal(assetLoads, 0);
-  assert.equal(apiCalls, 0);
+  const unauthenticated = await runFt161CloudflareOneShot({ ...input, authenticatedEmail: undefined }, deps);
+  const nonOwner = await runFt161CloudflareOneShot(input, deps);
+
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(unauthenticated.body.code, "x1b_unauthorized");
+  assert.equal(nonOwner.status, 403);
+  assert.equal(nonOwner.body.code, "x1b_sole_owner_required");
+  assert.deepEqual(audit, { auth: 1, body: 0, assets: 0, claims: 0, api: 0 });
 });
 
-test("X1B Cloudflare route requires both existing API key and disposable execution token", async () => {
-  let apiCalls = 0;
-  const missingToken = dependencies({ expectedToken: undefined, openAiFetch: async () => { apiCalls++; throw new Error("must not run"); } });
-  const missingApiKey = dependencies({ apiKey: undefined, openAiFetch: async () => { apiCalls++; throw new Error("must not run"); } });
+test("X1B exact confirmation and API-key guards both run before assets, claim, or AI", async () => {
+  const audit = { assets: 0, claims: 0, api: 0 };
+  const guarded = {
+    claimOnce: async () => { audit.claims++; return true; },
+    loadAsset: async () => { audit.assets++; return approvedPng(); },
+    openAiFetch: async () => { audit.api++; throw new Error("must not run"); },
+  };
 
-  assert.equal((await runFt161CloudflareOneShot(authorizedInput(), missingToken)).status, 503);
-  assert.equal((await runFt161CloudflareOneShot(authorizedInput(), missingApiKey)).status, 503);
-  assert.equal(apiCalls, 0);
+  const badConfirmation = await runFt161CloudflareOneShot(
+    authorizedInput({ readRequestBody: async () => ({ fixture: "FT161" }) }),
+    dependencies(guarded),
+  );
+  const missingApiKey = await runFt161CloudflareOneShot(
+    authorizedInput(),
+    dependencies({ ...guarded, apiKey: undefined }),
+  );
+
+  assert.equal(badConfirmation.status, 400);
+  assert.equal(badConfirmation.body.code, "x1b_confirmation_required");
+  assert.equal(missingApiKey.status, 503);
+  assert.equal(missingApiKey.body.code, "x1b_openai_not_configured");
+  assert.deepEqual(audit, { assets: 0, claims: 0, api: 0 });
 });
 
-test("X1B Cloudflare route loads only fixed FT161 assets in deterministic order", async () => {
-  const loaded = [];
+test("X1B successful ordering is identity owner, confirmation, key, fixed assets, claim, then one fetch", async () => {
+  const order = [];
   const deps = dependencies({
+    authorizeSoleOwner: async (email) => { order.push(`owner:${email}`); return true; },
     loadAsset: async (path) => {
-      loaded.push(path);
+      order.push(`asset:${path}`);
       return path === FT161_CLOUDFLARE_ONE_SHOT.sourceAssetPath
         ? new Uint8Array([255, 216, 255, 217])
         : approvedPng();
     },
+    claimOnce: async () => { order.push("claim"); return true; },
+    openAiFetch: async () => {
+      order.push("fetch");
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify(validModelResponse()) } }],
+      }), { status: 200 });
+    },
   });
-  const result = await runFt161CloudflareOneShot(authorizedInput(), deps);
+  Object.defineProperty(deps, "apiKey", {
+    configurable: true,
+    get() { order.push("api-key"); return "synthetic-key-never-sent"; },
+  });
+
+  const result = await runFt161CloudflareOneShot(authorizedInput({
+    readRequestBody: async () => { order.push("confirmation"); return confirmation(); },
+  }), deps);
 
   assert.equal(result.status, 200);
-  assert.deepEqual(loaded, [
-    "/reference/history/ft161-source.jpg",
-    "/reference/history/ft161-approved.png",
+  assert.deepEqual(order, [
+    "owner:owner@hobruk.test",
+    "confirmation",
+    "api-key",
+    `asset:${FT161_CLOUDFLARE_ONE_SHOT.sourceAssetPath}`,
+    `asset:${FT161_CLOUDFLARE_ONE_SHOT.approvedAssetPath}`,
+    "claim",
+    "fetch",
   ]);
 });
 
-test("X1B Cloudflare route makes exactly one synthetic OpenAI fetch and returns the full artifact", async () => {
+test("X1B already-claimed returns 409 after fixed validation with zero OpenAI fetches", async () => {
+  let assetLoads = 0;
+  let claims = 0;
+  let apiCalls = 0;
+  const result = await runFt161CloudflareOneShot(authorizedInput(), dependencies({
+    loadAsset: async (path) => {
+      assetLoads++;
+      return path === FT161_CLOUDFLARE_ONE_SHOT.sourceAssetPath
+        ? new Uint8Array([255, 216, 255, 217])
+        : approvedPng();
+    },
+    claimOnce: async () => { claims++; return false; },
+    openAiFetch: async () => { apiCalls++; throw new Error("must not run"); },
+  }));
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, "x1b_already_claimed");
+  assert.equal(assetLoads, 2);
+  assert.equal(claims, 1);
+  assert.equal(apiCalls, 0);
+});
+
+test("X1B successful path makes exactly one synthetic OpenAI fetch and returns the full artifact", async () => {
   let apiCalls = 0;
   const deps = dependencies({
     openAiFetch: async (url, init) => {
       apiCalls++;
       assert.equal(url, "https://api.openai.com/v1/chat/completions");
+      assert.equal(init.headers.Authorization, "Bearer synthetic-key-never-sent");
       const request = JSON.parse(init.body);
       assert.equal(request.messages[1].content[1].image_url.url.startsWith("data:image/jpeg;base64,"), true);
       assert.equal(request.messages[1].content[2].image_url.url.startsWith("data:image/png;base64,"), true);
@@ -139,39 +264,46 @@ test("X1B Cloudflare route makes exactly one synthetic OpenAI fetch and returns 
   assert.equal(typeof artifact.rawResponse, "string");
 });
 
-test("X1B Cloudflare durable claim blocks a second attempt and upstream failure never retries", async () => {
+test("X1B transport failure consumes one claim, makes one fetch, and never retries", async () => {
+  let claims = 0;
   let apiCalls = 0;
-  const deps = dependencies({
-    openAiFetch: async () => {
-      apiCalls++;
-      return new Response(JSON.stringify({ error: { message: "synthetic upstream failure" } }), { status: 500 });
-    },
-  });
+  const result = await runFt161CloudflareOneShot(authorizedInput(), dependencies({
+    claimOnce: async () => { claims++; return true; },
+    openAiFetch: async () => { apiCalls++; throw new Error("synthetic transport failure"); },
+  }));
 
-  const first = await runFt161CloudflareOneShot(authorizedInput(), deps);
-  const second = await runFt161CloudflareOneShot(authorizedInput(), deps);
-
-  assert.equal(first.status, 502);
-  assert.equal(first.body.artifact.report.validation.valid, false);
-  assert.equal(second.status, 409);
+  assert.equal(result.status, 502);
+  assert.equal(result.body.code, "x1b_transport_failed");
+  assert.equal(result.body.requestCount, 1);
+  assert.equal(result.body.retryCount, 0);
+  assert.equal(claims, 1);
   assert.equal(apiCalls, 1);
 });
 
-test("X1B Cloudflare malformed semantic output fails closed after one request", async () => {
-  let apiCalls = 0;
+test("X1B upstream and malformed semantic failures each make one request with zero retry path", async () => {
+  let upstreamCalls = 0;
+  const upstream = await runFt161CloudflareOneShot(authorizedInput(), dependencies({
+    openAiFetch: async () => {
+      upstreamCalls++;
+      return new Response(JSON.stringify({ error: { message: "synthetic upstream failure" } }), { status: 500 });
+    },
+  }));
+
+  let malformedCalls = 0;
   const malformed = validModelResponse();
   malformed.semanticPlanes.planes[0].ownerId = "owner-missing";
-  const deps = dependencies({
+  const invalidContract = await runFt161CloudflareOneShot(authorizedInput(), dependencies({
     openAiFetch: async () => {
-      apiCalls++;
+      malformedCalls++;
       return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(malformed) } }] }), { status: 200 });
     },
-  });
-  const result = await runFt161CloudflareOneShot(authorizedInput(), deps);
+  }));
 
-  assert.equal(result.status, 422);
-  assert.equal(result.body.ok, false);
-  assert.equal(result.body.artifact.report.validation.valid, false);
-  assert.match(result.body.artifact.report.validation.error, /missing owner/);
-  assert.equal(apiCalls, 1);
+  assert.equal(upstream.status, 502);
+  assert.equal(upstream.body.artifact.report.request.retryCount, 0);
+  assert.equal(upstreamCalls, 1);
+  assert.equal(invalidContract.status, 422);
+  assert.equal(invalidContract.body.artifact.report.request.retryCount, 0);
+  assert.match(invalidContract.body.artifact.report.validation.error, /missing owner/);
+  assert.equal(malformedCalls, 1);
 });

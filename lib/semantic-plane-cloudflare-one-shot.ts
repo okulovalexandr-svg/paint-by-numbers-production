@@ -13,10 +13,33 @@ export const FT161_CLOUDFLARE_ONE_SHOT = Object.freeze({
   sourceAssetPath: "/reference/history/ft161-source.jpg",
   approvedAssetPath: "/reference/history/ft161-approved.png",
   confirmation: "RUN_FT161_X1B_ONCE",
-  tokenHeader: "x-x1b-one-shot-token",
   requestLimit: 1,
   retryLimit: 0,
 });
+
+export const X1B_HOBRUK_ORG_ID = "org_hobruk";
+export const X1B_SOLE_OWNER_QUERY = [
+  "SELECT",
+  "COUNT(*) AS owner_count,",
+  "COALESCE(SUM(CASE WHEN LOWER(u.email) = LOWER(?) THEN 1 ELSE 0 END), 0) AS matching_owner_count",
+  "FROM memberships AS m",
+  "INNER JOIN users AS u ON u.id = m.user_id",
+  "WHERE m.organization_id = ? AND m.role = 'owner'",
+].join(" ");
+
+export type X1BReadStatementLike = {
+  bind: (...values: unknown[]) => X1BReadStatementLike;
+  first: <T>() => Promise<T | null>;
+};
+
+export type X1BReadDatabaseLike = {
+  prepare: (query: string) => X1BReadStatementLike;
+};
+
+type X1BOwnerAuthorizationRow = {
+  owner_count?: number | string | null;
+  matching_owner_count?: number | string | null;
+};
 
 type OpenAiUsage = {
   prompt_tokens?: number;
@@ -43,21 +66,23 @@ export type Ft161OneShotResult = {
 
 export type Ft161OneShotDependencies = {
   apiKey?: string;
-  expectedToken?: string;
+  authorizeSoleOwner: (email: string) => Promise<boolean>;
   claimOnce: () => Promise<boolean>;
   loadAsset: (path: string) => Promise<Uint8Array>;
   openAiFetch: typeof fetch;
   now?: () => number;
 };
 
-function safeEqual(left: string, right: string) {
-  const encoder = new TextEncoder();
-  const leftBytes = encoder.encode(left);
-  const rightBytes = encoder.encode(right);
-  let difference = leftBytes.length ^ rightBytes.length;
-  const length = Math.max(leftBytes.length, rightBytes.length);
-  for (let index = 0; index < length; index++) difference |= (leftBytes[index] || 0) ^ (rightBytes[index] || 0);
-  return difference === 0;
+export async function isSoleExistingHobrukOwner(
+  database: X1BReadDatabaseLike | undefined,
+  authenticatedEmail: string,
+) {
+  if (!database) throw new Error("Cloudflare D1 binding DB is unavailable");
+  const row = await database.prepare(X1B_SOLE_OWNER_QUERY)
+    .bind(authenticatedEmail, X1B_HOBRUK_ORG_ID)
+    .first<X1BOwnerAuthorizationRow>();
+  return Number(row?.owner_count || 0) === 1
+    && Number(row?.matching_owner_count || 0) === 1;
 }
 
 function exactConfirmation(input: unknown) {
@@ -107,18 +132,31 @@ function noStore(status: number, body: Record<string, unknown>): Ft161OneShotRes
 }
 
 export async function runFt161CloudflareOneShot(
-  input: { authorized: boolean; providedToken?: string; requestBody: unknown },
+  input: { authenticatedEmail?: string; readRequestBody: () => Promise<unknown> },
   dependencies: Ft161OneShotDependencies,
 ): Promise<Ft161OneShotResult> {
-  if (!input.authorized) return noStore(401, { error: "authentication required", code: "x1b_unauthorized" });
-  if (!dependencies.expectedToken) return noStore(503, { error: "X1B one-shot token is not configured", code: "x1b_token_not_configured" });
-  if (!input.providedToken || !safeEqual(input.providedToken, dependencies.expectedToken)) {
-    return noStore(403, { error: "X1B one-shot token rejected", code: "x1b_token_rejected" });
+  const authenticatedEmail = input.authenticatedEmail?.trim();
+  if (!authenticatedEmail) {
+    return noStore(401, { error: "authentication required", code: "x1b_unauthorized" });
   }
-  if (!exactConfirmation(input.requestBody)) {
+
+  let soleExistingOwner = false;
+  try {
+    soleExistingOwner = await dependencies.authorizeSoleOwner(authenticatedEmail);
+  } catch {
+    return noStore(503, { error: "X1B owner authorization is unavailable", code: "x1b_authorization_unavailable" });
+  }
+  if (!soleExistingOwner) {
+    return noStore(403, { error: "sole existing Hobruk owner required", code: "x1b_sole_owner_required" });
+  }
+
+  let requestBody: unknown = null;
+  try { requestBody = await input.readRequestBody(); } catch { /* Exact confirmation validation returns 400. */ }
+  if (!exactConfirmation(requestBody)) {
     return noStore(400, { error: "Exact FT161 one-shot confirmation is required", code: "x1b_confirmation_required" });
   }
-  if (!dependencies.apiKey) return noStore(503, { error: "OPENAI_API_KEY is not configured", code: "x1b_openai_not_configured" });
+  const apiKey = dependencies.apiKey;
+  if (!apiKey) return noStore(503, { error: "OPENAI_API_KEY is not configured", code: "x1b_openai_not_configured" });
 
   let sourceBytes: Uint8Array;
   let approvedBytes: Uint8Array;
@@ -155,7 +193,7 @@ export async function runFt161CloudflareOneShot(
     response = await dependencies.openAiFetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${dependencies.apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(request),

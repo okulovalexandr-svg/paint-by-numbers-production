@@ -2,13 +2,15 @@ import { env } from "cloudflare:workers";
 
 import {
   FT161_CLOUDFLARE_ONE_SHOT,
+  isSoleExistingHobrukOwner,
   runFt161CloudflareOneShot,
 } from "../../../../lib/semantic-plane-cloudflare-one-shot.ts";
-import { ensureWorkspaceUser } from "../../../../lib/tenant";
+import { getChatGPTUser } from "../../../chatgpt-auth";
 
 type D1ResultLike = { meta?: { changes?: number } };
 type D1StatementLike = {
   bind: (...values: unknown[]) => D1StatementLike;
+  first: <T>() => Promise<T | null>;
   run: () => Promise<D1ResultLike>;
 };
 type D1DatabaseLike = {
@@ -18,7 +20,6 @@ type D1DatabaseLike = {
 type X1BRuntime = {
   DB?: D1DatabaseLike;
   OPENAI_API_KEY?: string;
-  X1B_ONE_SHOT_TOKEN?: string;
 };
 
 async function claimFt161Once(database: D1DatabaseLike | undefined) {
@@ -50,18 +51,17 @@ async function loadFixedAsset(request: Request, path: string) {
 }
 
 export async function POST(request: Request) {
-  const session = await ensureWorkspaceUser();
+  const identity = await getChatGPTUser();
   const runtime = env as unknown as X1BRuntime;
-  let requestBody: unknown = null;
-  try { requestBody = await request.json(); } catch { /* Exact confirmation validation returns 400. */ }
 
   const result = await runFt161CloudflareOneShot({
-    authorized: Boolean(session),
-    providedToken: request.headers.get(FT161_CLOUDFLARE_ONE_SHOT.tokenHeader) || undefined,
-    requestBody,
+    authenticatedEmail: identity?.email,
+    readRequestBody: async () => {
+      try { return await request.json(); } catch { return null; }
+    },
   }, {
     apiKey: runtime.OPENAI_API_KEY,
-    expectedToken: runtime.X1B_ONE_SHOT_TOKEN,
+    authorizeSoleOwner: (email) => isSoleExistingHobrukOwner(runtime.DB, email),
     claimOnce: () => claimFt161Once(runtime.DB),
     loadAsset: (path) => loadFixedAsset(request, path),
     openAiFetch: fetch,
