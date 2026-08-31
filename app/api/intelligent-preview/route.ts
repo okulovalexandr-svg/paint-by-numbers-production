@@ -17,6 +17,16 @@ type ImageResponse = {
 type OpenAiImageOutcome = { response: Response; result: ImageResponse; streaming: boolean };
 
 type PromptPaint = { code: string; name: string; hex: string };
+type ProductionCorrectionStrategy = "global-rebuild" | "local-repair";
+type ProductionReadinessDiagnostics = {
+  regionCount: number;
+  failCount: number;
+  fitCoverage: number;
+  failedAreaPercent: number;
+  densityPer100Cm2: number;
+  semanticFailCount: number;
+  nonSemanticFailCount: number;
+};
 
 function isPromptPaint(value: unknown): value is PromptPaint {
   if (!value || typeof value !== "object") return false;
@@ -25,6 +35,25 @@ function isPromptPaint(value: unknown): value is PromptPaint {
     && typeof paint.name === "string"
     && typeof paint.hex === "string"
     && /^#[0-9A-F]{6}$/i.test(paint.hex);
+}
+
+function parseProductionReadinessDiagnostics(value: FormDataEntryValue | null): ProductionReadinessDiagnostics | null {
+  try {
+    const parsed = JSON.parse(String(value || "")) as Record<string, unknown>;
+    const keys = [
+      "regionCount",
+      "failCount",
+      "fitCoverage",
+      "failedAreaPercent",
+      "densityPer100Cm2",
+      "semanticFailCount",
+      "nonSemanticFailCount",
+    ] as const;
+    if (keys.some((key) => typeof parsed[key] !== "number" || !Number.isFinite(parsed[key]))) return null;
+    return Object.fromEntries(keys.map((key) => [key, parsed[key]])) as ProductionReadinessDiagnostics;
+  } catch {
+    return null;
+  }
 }
 
 function friendlyOpenAiError(result: ImageResponse, status: number) {
@@ -110,7 +139,16 @@ function relayImageRequest(execute: () => Promise<OpenAiImageOutcome>) {
   });
 }
 
-function buildPrompt(targetColors: number, profile: string, correction: string, palette: PromptPaint[], hasReference: boolean) {
+function buildPrompt(
+  targetColors: number,
+  profile: string,
+  correction: string,
+  palette: PromptPaint[],
+  hasReference: boolean,
+  mode: string,
+  correctionStrategy?: ProductionCorrectionStrategy,
+  readiness?: ProductionReadinessDiagnostics | null,
+) {
   const subjectRules: Record<string, string> = {
     portrait: "Build the people first. Faces, identity, eyes, pupils, eyelids, eyebrows, nose planes, lips, ears, hairline, hands, fingers, clothing folds, jewelry and every recognizable accessory are protected details.",
     animal: "Build the animal first. Eyes, highlights, pupils, eyelids, nose, nostrils, mouth, ears, whisker roots, paws, claws and characteristic coat markings are protected details.",
@@ -118,6 +156,76 @@ function buildPrompt(targetColors: number, profile: string, correction: string, 
     auto: "Detect every meaningful subject before simplifying anything. Protect faces, eyes, hands, animals, lettering, emblems, logos, signs, jewelry, accessories and every identity- or story-defining small object.",
   };
   const paletteList = palette.map((paint, index) => `${index + 1}. ${paint.code} · ${paint.name} · ${paint.hex}`).join("\n");
+
+  if (mode === "production-correction" && correctionStrategy && readiness) {
+    const activeColorRule = correctionStrategy === "global-rebuild"
+      ? profile === "portrait"
+        ? "Use 24–32 actually active colors across the finished portrait/people/wedding image."
+        : profile === "auto"
+          ? "If the source is a portrait, people or wedding scene, use 24–32 actually active colors; otherwise use a clearly smaller coherent subset of the allowed pool."
+          : "Use a clearly smaller coherent active-color subset of the allowed pool; do not keep colors active merely because they are available."
+      : "Avoid near-duplicate active tones, but do not apply a fixed active-color budget in local-repair mode.";
+    const inputLabels = correctionStrategy === "global-rebuild"
+      ? hasReference
+        ? `- Image 1 is the original source and is the primary identity, composition, pose and crop reference.
+- Image 2 is the failed palette-ready preview. Use it only as a production-palette and broad layout reference; do not preserve its microgeometry.
+- Image 3 is the diagnostic failure overlay. Use it only to understand the scale and location of failures; it must never appear in the result.`
+        : `- Image 1 is the failed palette-ready preview. Use it as a production-palette and broad composition/layout reference; do not preserve its microgeometry.
+- Image 2 is the diagnostic failure overlay. Use it only to understand the scale and location of failures; it must never appear in the result.`
+      : `- Image 1 is the current failed palette-ready preview and is the primary edit target.
+- Image 2 is the diagnostic failure overlay made from the exact failed 4-connected regions. Magenta marks semantic failures; orange marks nonsemantic failures. It is reference-only and must never appear in the result.
+${hasReference ? "- Image 3 is the original source reference. Use it only to preserve identity, composition and meaningful details." : ""}`;
+    const strategyRules = correctionStrategy === "global-rebuild"
+      ? `GLOBAL REBUILD STRATEGY
+- The current map is globally over-fragmented. Reconstruct the whole image into substantially larger coherent flat paint regions, especially across faces, eyes, hands, hair/fur and clothing.
+- Prefer the original source for identity and composition when it is provided. The failed preview is not microgeometry that must be preserved.
+- Preserve identity, pose, crop, silhouette, proportions and recognizable important details, while simplifying tonal modelling into broad contiguous shapes instead of texture or micro-shading.
+- Substantially reduce connected-region density and microfragmentation across the full image. Do not invent a new numeric pass threshold.
+- ACTIVE-COLOR COMPRESSION: ${activeColorRule}
+- Treat the selected production palette only as an allowed color pool. Aggressively consolidate near-identical shades in skin, white clothing, background, hair and bouquet into fewer reusable active colors.
+- Remove rare redundant shades by mapping those areas to the nearest already-active coherent tone. Never create a microregion to keep a rare shade active.`
+      : `LOCAL REPAIR STRATEGY
+- Keep Image 1 as the primary edit target and preserve its already-good coherent regions.
+- Rework highlighted FAIL zones only as much as needed to create larger coherent paintable shapes.
+- Preserve composition, crop, identity, pose, proportions and all already-good major forms.
+- ${activeColorRule}
+- Consolidate near-duplicate shades where that does not disturb already-good geometry; never add a small region merely to retain a rare shade.`;
+    return `
+You are correcting an existing palette-ready paint-by-numbers preview for production.
+
+INPUTS
+${inputLabels}
+
+CURRENT READINESS DIAGNOSTICS
+- Regions: ${readiness.regionCount}
+- FAIL regions: ${readiness.failCount}
+- Fit coverage: ${readiness.fitCoverage.toFixed(2)}%
+- Failed area: ${readiness.failedAreaPercent.toFixed(3)}%
+- Region density: ${readiness.densityPer100Cm2.toFixed(2)} per 100 cm²
+- Semantic FAIL: ${readiness.semanticFailCount}
+- Nonsemantic FAIL: ${readiness.nonSemanticFailCount}
+
+${strategyRules}
+
+REQUIRED CORRECTION
+- Merge unnecessary local tonal fragmentation into larger coherent paint regions.
+- Face and skin: use broad planes; no stippling, freckles-as-dots, narrow tonal ribbons or crumb-like highlights.
+- Eyes: preserve recognizable eye shape, pupil and highlight only when they can be coherent paintable regions; do not multiply tiny eyelid or highlight fragments.
+- Hands and fingers: preserve readable structure with fewer wider regions, never many thin slivers.
+- Hair and fur: preserve direction and characteristic markings with grouped strands and patches, never hundreds of tiny streaks.
+- White clothing and light areas: avoid near-identical alternating microtones and isolated highlight islands.
+- Bouquets, foliage and repeated texture: group small repeated elements into larger coherent clusters where visually acceptable.
+- Total connected-region count must not increase as a way of adding detail. Never replace one failed semantic region with multiple smaller tonal fragments.
+- No dots, crumbs, narrow rings, one-pixel or very-thin bands, checker-like palette alternation, dithering, gradients, noise, antialiasing or micro-islands.
+- Every visible 4-connected paint region must physically fit one internal production number at 5 pt or larger.
+- Use only exact solid colors from the allowed production-palette pool below. The active colors in the result must be a subset of this pool. It is NOT necessary to use every listed color. Never create tiny regions merely to preserve a rarely used palette color.
+- Do not add numbers, contours, leader lines, annotations, overlay colors or diagnostic marks.
+
+ALLOWED PRODUCTION-PALETTE POOL (${targetColors} colors; active subset may be smaller)
+${paletteList}
+
+Return only the corrected full-frame color preview.`.trim();
+  }
 
   return `
 You are preparing a professional paint-by-numbers production preview for Hobruk.
@@ -197,11 +305,33 @@ export async function POST(request: Request) {
   }
   if (!promptPalette.length) return Response.json({ error: "production palette is required" }, { status: 400 });
   const profile = String(data.get("profile") || "auto");
+  const mode = data.get("mode") === "production-correction" ? "production-correction" : "standard";
   const correction = String(data.get("correction") || "").slice(0, 2000);
   const quality = data.get("quality") === "medium" ? "medium" : "high";
+  const readinessDiagnostics = mode === "production-correction"
+    ? parseProductionReadinessDiagnostics(data.get("readinessDiagnostics"))
+    : null;
+  if (mode === "production-correction" && !readinessDiagnostics) {
+    return Response.json({ error: "production readiness diagnostics are required" }, { status: 400 });
+  }
+  const correctionStrategy: ProductionCorrectionStrategy | undefined = readinessDiagnostics
+    ? readinessDiagnostics.fitCoverage < 25 ? "global-rebuild" : "local-repair"
+    : undefined;
+
+  const failureOverlay = data.get("failureOverlay");
+  if (mode === "production-correction" && !(failureOverlay instanceof File)) {
+    return Response.json({ error: "production failure overlay is required" }, { status: 400 });
+  }
+  if (failureOverlay instanceof File && (!allowedTypes.has(failureOverlay.type) || failureOverlay.size > 25 * 1024 * 1024)) {
+    return Response.json({ error: "invalid production failure overlay" }, { status: 415 });
+  }
+  const sourceReference = data.get("sourceReference");
+  if (sourceReference instanceof File && (!allowedTypes.has(sourceReference.type) || sourceReference.size > 25 * 1024 * 1024)) {
+    return Response.json({ error: "invalid source reference" }, { status: 415 });
+  }
 
   let reference: Blob | null = null;
-  if (quality === "high") {
+  if (quality === "high" && mode !== "production-correction") {
     try {
       const referenceResponse = await fetch(new URL("/reference/history/style-reference.jpg", request.url));
       if (referenceResponse.ok) {
@@ -215,9 +345,32 @@ export async function POST(request: Request) {
   const callOpenAi = async (standardCompatibility = false) => {
     const openaiForm = new FormData();
     openaiForm.set("model", "gpt-image-2");
-    openaiForm.append("image[]", image, image.name || "source.jpg");
-    if (reference) openaiForm.append("image[]", reference, "hobruk-style-reference.jpg");
-    openaiForm.set("prompt", buildPrompt(promptPalette.length, profile, correction, promptPalette, Boolean(reference)));
+    if (mode === "production-correction") {
+      if (correctionStrategy === "global-rebuild" && sourceReference instanceof File) {
+        openaiForm.append("image[]", sourceReference, sourceReference.name || "original-source.jpg");
+        openaiForm.append("image[]", image, image.name || "failed-production-preview.png");
+        openaiForm.append("image[]", failureOverlay as File, "production-failure-overlay.png");
+      } else {
+        openaiForm.append("image[]", image, image.name || "failed-production-preview.png");
+        openaiForm.append("image[]", failureOverlay as File, "production-failure-overlay.png");
+        if (sourceReference instanceof File) openaiForm.append("image[]", sourceReference, sourceReference.name || "original-source.jpg");
+      }
+    } else if (reference) {
+      openaiForm.append("image[]", image, image.name || "source.jpg");
+      openaiForm.append("image[]", reference, "hobruk-style-reference.jpg");
+    } else {
+      openaiForm.append("image[]", image, image.name || "source.jpg");
+    }
+    openaiForm.set("prompt", buildPrompt(
+      promptPalette.length,
+      profile,
+      correction,
+      promptPalette,
+      mode === "production-correction" ? sourceReference instanceof File : Boolean(reference),
+      mode,
+      correctionStrategy,
+      readinessDiagnostics,
+    ));
     openaiForm.set("quality", quality);
     openaiForm.set("size", standardCompatibility ? "1024x1536" : quality === "medium" ? "800x1008" : "1024x1280");
     openaiForm.set("stream", "true");
