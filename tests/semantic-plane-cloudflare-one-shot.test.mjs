@@ -55,6 +55,7 @@ function dependencies(overrides = {}) {
       choices: [{ message: { content: JSON.stringify(validModelResponse()) } }],
       usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 },
     }), { status: 200, headers: { "x-request-id": "synthetic-request" } }),
+    createClientRequestId: () => "synthetic-client-request",
     now: (() => { let value = 100; return () => value += 25; })(),
     ...overrides,
   };
@@ -255,6 +256,7 @@ test("X1B successful path makes exactly one synthetic OpenAI fetch and returns t
       apiCalls++;
       assert.equal(url, "https://api.openai.com/v1/chat/completions");
       assert.equal(init.headers.Authorization, "Bearer synthetic-key-never-sent");
+      assert.equal(init.headers["X-Client-Request-Id"], "synthetic-client-request");
       const request = JSON.parse(init.body);
       assert.equal(request.messages[1].content[1].image_url.url.startsWith("data:image/jpeg;base64,"), true);
       assert.equal(request.messages[1].content[2].image_url.url.startsWith("data:image/png;base64,"), true);
@@ -272,6 +274,7 @@ test("X1B successful path makes exactly one synthetic OpenAI fetch and returns t
   assert.equal(result.body.ok, true);
   assert.equal(artifact.report.request.requestCount, 1);
   assert.equal(artifact.report.request.retryCount, 0);
+  assert.equal(artifact.report.request.clientRequestId, "synthetic-client-request");
   assert.equal(artifact.report.response.requestId, "synthetic-request");
   assert.equal(artifact.report.response.costUsd, 0.008);
   assert.equal(artifact.report.validation.valid, true);
@@ -289,6 +292,7 @@ test("X1B transport failure consumes one claim, makes one fetch, and never retri
 
   assert.equal(result.status, 502);
   assert.equal(result.body.code, "x1b_transport_failed");
+  assert.equal(result.body.clientRequestId, "synthetic-client-request");
   assert.equal(result.body.requestCount, 1);
   assert.equal(result.body.retryCount, 0);
   assert.equal(claims, 1);

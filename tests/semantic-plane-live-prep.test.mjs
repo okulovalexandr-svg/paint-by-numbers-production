@@ -8,9 +8,11 @@ import {
   assertFt161LiveOptIn,
   attributeSemanticFailComponents,
   buildFt161SemanticPlaneMessages,
+  buildFt161SemanticPlaneRequest,
   parseSemanticPlaneLiveResponse,
   semanticPlaneLiveResponseJsonSchema,
 } from "../lib/semantic-plane-live.ts";
+import { semanticPlaneDocumentJsonSchema } from "../lib/semantic-planes.ts";
 
 const rectangle = (x0, y0, x1, y1) => [
   { x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 },
@@ -48,6 +50,20 @@ test("X1B-PREP prompt and schema require the approved-preview coordinate frame",
   const wrongFrame = validEnvelope();
   wrongFrame.coordinateFrame = "image-1-source-normalized-0..1000";
   assert.throws(() => parseSemanticPlaneLiveResponse(wrongFrame, 10, 10), /must use image-2-approved-preview/);
+});
+
+test("X1B strict request removes only API-incompatible schema metadata", () => {
+  const request = buildFt161SemanticPlaneRequest(
+    "data:image/jpeg;base64,SOURCE",
+    "data:image/png;base64,APPROVED",
+  );
+  const strictDocument = request.response_format.json_schema.schema.properties.semanticPlanes;
+
+  assert.equal(typeof semanticPlaneDocumentJsonSchema.$schema, "string");
+  assert.equal("$schema" in strictDocument, false);
+  assert.deepEqual(strictDocument.properties, semanticPlaneDocumentJsonSchema.properties);
+  assert.deepEqual(strictDocument.required, semanticPlaneDocumentJsonSchema.required);
+  assert.equal(strictDocument.additionalProperties, semanticPlaneDocumentJsonSchema.additionalProperties);
 });
 
 test("X1B-PREP strict valid response parses and rasterizes identically twice", () => {

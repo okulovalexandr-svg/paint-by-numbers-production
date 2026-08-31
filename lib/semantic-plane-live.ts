@@ -27,6 +27,10 @@ export const SEMANTIC_PLANE_COST_BASIS = Object.freeze({
   outputUsdPerMillionTokens: 12,
 });
 
+const semanticPlaneStrictResponseJsonSchema = Object.fromEntries(
+  Object.entries(semanticPlaneDocumentJsonSchema).filter(([keyword]) => keyword !== "$schema"),
+) as Omit<typeof semanticPlaneDocumentJsonSchema, "$schema">;
+
 export const semanticPlaneLiveResponseJsonSchema = {
   type: "object",
   additionalProperties: false,
@@ -36,7 +40,7 @@ export const semanticPlaneLiveResponseJsonSchema = {
       const: APPROVED_PREVIEW_COORDINATE_FRAME,
       description: "All polygon coordinates refer to Image 2, the approved preview, normalized to 0..1000.",
     },
-    semanticPlanes: semanticPlaneDocumentJsonSchema,
+    semanticPlanes: semanticPlaneStrictResponseJsonSchema,
   },
   required: ["coordinateFrame", "semanticPlanes"],
 } as const;

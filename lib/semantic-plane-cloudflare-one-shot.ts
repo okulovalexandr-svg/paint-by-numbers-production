@@ -68,6 +68,7 @@ export type Ft161OneShotDependencies = {
   claimOnce: () => Promise<boolean>;
   loadAsset: (path: string) => Promise<Uint8Array>;
   openAiFetch: typeof fetch;
+  createClientRequestId?: () => string;
   now?: () => number;
 };
 
@@ -179,6 +180,7 @@ export async function runFt161CloudflareOneShot(
     return noStore(409, { error: "FT161 X1B one-shot was already claimed", code: "x1b_already_claimed" });
   }
 
+  const clientRequestId = dependencies.createClientRequestId?.() || crypto.randomUUID();
   const now = dependencies.now || (() => performance.now());
   const startedAt = now();
   const request = buildFt161SemanticPlaneRequest(
@@ -192,6 +194,7 @@ export async function runFt161CloudflareOneShot(
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
+        "X-Client-Request-Id": clientRequestId,
       },
       body: JSON.stringify(request),
     });
@@ -199,6 +202,7 @@ export async function runFt161CloudflareOneShot(
     return noStore(502, {
       error: error instanceof Error ? error.message : String(error),
       code: "x1b_transport_failed",
+      clientRequestId,
       requestCount: 1,
       retryCount: 0,
     });
@@ -218,6 +222,7 @@ export async function runFt161CloudflareOneShot(
         { image: 2, role: "approved preview geometry/coordinate reference", path: FT161_X1B_LIVE_SPEC.approvedPreviewPath },
       ],
       coordinateFrame: APPROVED_PREVIEW_COORDINATE_FRAME,
+      clientRequestId,
       requestCount: 1,
       requestLimit: FT161_CLOUDFLARE_ONE_SHOT.requestLimit,
       retryCount: 0,
